@@ -1,4 +1,4 @@
-# Game Design Document: **The Infinite Breadboard**
+# Game Design Document: **The Infinite Breadboard/Breadboard 74**
 
 ## 1\. High Concept
 
