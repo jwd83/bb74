@@ -12,6 +12,8 @@ func _init() -> void:
 	_test_binary_gate_truth_tables()
 	_test_not_truth_table()
 	_test_conflicting_toggle_drivers()
+	_test_connect_pin_reassigns_cleanly()
+	_test_connect_pins_merges_existing_nets()
 	_test_full_adder_ic_truth_table()
 
 	if _failures.is_empty():
@@ -80,6 +82,43 @@ func _test_conflicting_toggle_drivers() -> void:
 
 	_assert_true(circuit.settle(), "conflicting driver circuit settled")
 	_assert_equal(circuit.nets[net_id].value, SignalValue.State.X, "conflicting toggle drivers produce X")
+
+
+func _test_connect_pin_reassigns_cleanly() -> void:
+	var library: Dictionary = BuiltinChipsScript.create_standard_library()
+	var circuit = CircuitScript.new()
+	var input = circuit.add_chip(library[&"toggle"], Vector2i.ZERO, "Input")
+	var first_net: int = circuit.add_net("A")
+	var second_net: int = circuit.add_net("B")
+
+	circuit.connect_pin(input, &"OUT", first_net)
+	circuit.connect_pin(input, &"OUT", second_net)
+
+	_assert_equal(circuit.nets[first_net].connections.size(), 0, "old net loses reassigned pin")
+	_assert_equal(circuit.nets[second_net].connections.size(), 1, "new net keeps reassigned pin")
+	_assert_equal(input.pin_nets[&"OUT"], second_net, "pin records reassigned net")
+
+
+func _test_connect_pins_merges_existing_nets() -> void:
+	var library: Dictionary = BuiltinChipsScript.create_standard_library()
+	var circuit = CircuitScript.new()
+	var low_toggle = circuit.add_chip(library[&"toggle"], Vector2i.ZERO, "Low")
+	var high_toggle = circuit.add_chip(library[&"toggle"], Vector2i.ONE, "High")
+	var led = circuit.add_chip(library[&"led"], Vector2i(2, 0), "Probe")
+	var low_net: int = circuit.add_net("LOW")
+	var high_net: int = circuit.add_net("HIGH")
+
+	low_toggle.state["on"] = false
+	high_toggle.state["on"] = true
+	circuit.connect_pin(low_toggle, &"OUT", low_net)
+	circuit.connect_pin(led, &"IN", low_net)
+	circuit.connect_pin(high_toggle, &"OUT", high_net)
+	circuit.connect_pins(high_toggle, &"OUT", led, &"IN", "BUS")
+
+	_assert_equal(circuit.nets[low_net].connections.size(), 0, "merged source net is emptied")
+	_assert_equal(led.pin_nets[&"IN"], high_net, "merged source pin now points at target net")
+	_assert_true(circuit.settle(), "merged interactive wire circuit settled")
+	_assert_equal(circuit.nets[high_net].value, SignalValue.State.X, "merged opposing drivers conflict")
 
 
 func _test_full_adder_ic_truth_table() -> void:

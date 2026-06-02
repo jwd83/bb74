@@ -23,16 +23,59 @@ func add_chip(definition, position: Vector2i, label: String = ""):
 	var chip := ChipInstanceScript.new(_next_chip_id, definition, position, label)
 	_next_chip_id += 1
 	chips.append(chip)
+	changed.emit()
 	return chip
 
 
 func connect_pin(chip, pin_name: StringName, net_id: int) -> void:
+	if chip == null:
+		push_error("Cannot connect a null chip.")
+		return
 	if net_id < 0 or net_id >= nets.size():
 		push_error("Net %d does not exist." % net_id)
 		return
 
+	var previous_net_id: int = chip.pin_nets.get(pin_name, -1)
+	if _is_valid_net_id(previous_net_id):
+		if previous_net_id == net_id:
+			_ensure_connection(net_id, chip, pin_name)
+			changed.emit()
+			return
+		_remove_connection(previous_net_id, chip, pin_name)
+
 	chip.pin_nets[pin_name] = net_id
-	nets[net_id].connections.append({"chip": chip, "pin": pin_name})
+	_ensure_connection(net_id, chip, pin_name)
+	changed.emit()
+
+
+func connect_pins(chip_a, pin_a: StringName, chip_b, pin_b: StringName, net_label: String = "") -> int:
+	if chip_a == null or chip_b == null:
+		push_error("Cannot wire null chips.")
+		return -1
+
+	var net_a: int = chip_a.pin_nets.get(pin_a, -1)
+	var net_b: int = chip_b.pin_nets.get(pin_b, -1)
+	var has_net_a := _is_valid_net_id(net_a)
+	var has_net_b := _is_valid_net_id(net_b)
+
+	if has_net_a and has_net_b:
+		if net_a != net_b:
+			_merge_nets(net_a, net_b)
+		else:
+			changed.emit()
+		return net_a
+
+	var target_net_id := -1
+	if has_net_a:
+		target_net_id = net_a
+	elif has_net_b:
+		target_net_id = net_b
+	else:
+		target_net_id = add_net(net_label)
+
+	connect_pin(chip_a, pin_a, target_net_id)
+	connect_pin(chip_b, pin_b, target_net_id)
+	return target_net_id
 
 
 func read_pin(chip, pin_name: StringName) -> int:
@@ -103,6 +146,61 @@ func _evaluate_chip(chip) -> void:
 			_evaluate_quad_and(chip)
 		&"ic_7432":
 			_evaluate_quad_or(chip)
+
+
+func _is_valid_net_id(net_id: int) -> bool:
+	return net_id >= 0 and net_id < nets.size()
+
+
+func _ensure_connection(net_id: int, chip, pin_name: StringName) -> void:
+	if _connection_exists(net_id, chip, pin_name):
+		return
+	nets[net_id].connections.append({"chip": chip, "pin": pin_name})
+
+
+func _remove_connection(net_id: int, chip, pin_name: StringName) -> void:
+	if not _is_valid_net_id(net_id):
+		return
+
+	var connections: Array[Dictionary] = nets[net_id].connections
+	for index: int in range(connections.size() - 1, -1, -1):
+		if _connection_matches(connections[index], chip, pin_name):
+			connections.remove_at(index)
+
+
+func _connection_exists(net_id: int, chip, pin_name: StringName) -> bool:
+	if not _is_valid_net_id(net_id):
+		return false
+
+	for connection: Dictionary in nets[net_id].connections:
+		if _connection_matches(connection, chip, pin_name):
+			return true
+	return false
+
+
+func _connection_matches(connection: Dictionary, chip, pin_name: StringName) -> bool:
+	return connection.get("chip") == chip and connection.get("pin") == pin_name
+
+
+func _merge_nets(target_net_id: int, source_net_id: int) -> void:
+	if not _is_valid_net_id(target_net_id) or not _is_valid_net_id(source_net_id):
+		return
+	if target_net_id == source_net_id:
+		return
+
+	var source_connections: Array[Dictionary] = nets[source_net_id].connections.duplicate()
+	for connection: Dictionary in source_connections:
+		var chip = connection.get("chip")
+		var pin_name: StringName = connection.get("pin")
+		if chip == null:
+			continue
+		chip.pin_nets[pin_name] = target_net_id
+		_ensure_connection(target_net_id, chip, pin_name)
+
+	nets[source_net_id].connections.clear()
+	if nets[target_net_id].label.is_empty() and not nets[source_net_id].label.is_empty():
+		nets[target_net_id].label = nets[source_net_id].label
+	changed.emit()
 
 
 func _eval_not(value: int) -> int:

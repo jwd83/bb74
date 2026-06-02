@@ -9,6 +9,9 @@ const CHIP_SIZE := Vector2(124.0, 70.0)
 const GRID_SPACING := 20.0
 const BOARD_GRID_RECT := Rect2(Vector2(-29.5, -9.0), Vector2(59.0, 18.0))
 const DEFAULT_PAN := Vector2(0.0, -72.0)
+const TOOL_SELECT := &"select"
+const TOOL_WIRE := &"wire"
+const TOOL_PLACE := &"place"
 const WIRE_COLORS := [
 	Color(0.92, 0.09, 0.08),
 	Color(0.04, 0.34, 0.86),
@@ -19,12 +22,21 @@ const WIRE_COLORS := [
 ]
 
 var circuit
+var library: Dictionary = {}
 var pan := DEFAULT_PAN
 var zoom := 1.0
+var active_tool: StringName = TOOL_SELECT
+var selected_part_id: StringName = &""
 
 var _is_panning := false
 var _last_mouse_position := Vector2.ZERO
+var _last_mouse_screen_position := Vector2.ZERO
 var _hovered_net_id := -1
+var _hovered_pin: Dictionary = {}
+var _wire_start: Dictionary = {}
+var _has_placement_ghost := false
+var _ghost_grid_position := Vector2i.ZERO
+var _next_wire_net_number := 1
 
 
 func _ready() -> void:
@@ -37,8 +49,25 @@ func set_circuit(next_circuit) -> void:
 
 	circuit = next_circuit
 	_hovered_net_id = -1
+	_hovered_pin.clear()
+	_wire_start.clear()
 	if circuit:
 		circuit.changed.connect(queue_redraw)
+	queue_redraw()
+
+
+func set_library(next_library: Dictionary) -> void:
+	library = next_library
+	queue_redraw()
+
+
+func set_active_tool(tool_mode: StringName, part_id: StringName = &"") -> void:
+	active_tool = tool_mode
+	selected_part_id = part_id
+	_wire_start.clear()
+	_hovered_pin.clear()
+	_has_placement_ghost = false
+	_set_hovered_net(-1)
 	queue_redraw()
 
 
@@ -56,6 +85,7 @@ func _gui_input(event: InputEvent) -> void:
 
 
 func _handle_mouse_button(event: InputEventMouseButton) -> void:
+	_last_mouse_screen_position = event.position
 	if event.button_index == MOUSE_BUTTON_WHEEL_UP and event.pressed:
 		_zoom_at(event.position, 1.08)
 	elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
@@ -63,7 +93,16 @@ func _handle_mouse_button(event: InputEventMouseButton) -> void:
 	elif event.button_index == MOUSE_BUTTON_MIDDLE:
 		_is_panning = event.pressed
 		_last_mouse_position = event.position
+	elif event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
+		_cancel_transient_tool_state()
 	elif event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+		if active_tool == TOOL_PLACE:
+			_place_selected_part(event.position)
+			return
+		if active_tool == TOOL_WIRE:
+			_handle_wire_click(event.position)
+			return
+
 		var chip = _chip_at(event.position)
 		if chip and chip.definition.id == &"toggle":
 			chip.state["on"] = not chip.state.get("on", false)
@@ -73,8 +112,9 @@ func _handle_mouse_button(event: InputEventMouseButton) -> void:
 
 
 func _handle_mouse_motion(event: InputEventMouseMotion) -> void:
+	_last_mouse_screen_position = event.position
 	if not _is_panning:
-		_set_hovered_net(_hover_net_at(event.position))
+		_update_tool_hover(event.position)
 		return
 
 	pan += event.position - _last_mouse_position
@@ -86,6 +126,9 @@ func _handle_mouse_motion(event: InputEventMouseMotion) -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_MOUSE_EXIT:
 		_set_hovered_net(-1)
+		_hovered_pin.clear()
+		_has_placement_ghost = false
+		queue_redraw()
 
 
 func _zoom_at(screen_position: Vector2, factor: float) -> void:
@@ -94,6 +137,151 @@ func _zoom_at(screen_position: Vector2, factor: float) -> void:
 	var after := _screen_to_world(screen_position)
 	pan += (after - before) * zoom
 	queue_redraw()
+
+
+func _update_tool_hover(screen_position: Vector2) -> void:
+	match active_tool:
+		TOOL_PLACE:
+			var definition = _selected_part_definition()
+			_has_placement_ghost = definition != null
+			if definition:
+				_ghost_grid_position = _snapped_grid_position_for_definition(screen_position, definition)
+			_hovered_pin.clear()
+			_set_hovered_net(-1)
+			queue_redraw()
+		TOOL_WIRE:
+			_hovered_pin = _pin_at(screen_position)
+			_set_hovered_net(-1 if not _hovered_pin.is_empty() else _hover_net_at(screen_position))
+			queue_redraw()
+		_:
+			_hovered_pin.clear()
+			_has_placement_ghost = false
+			_set_hovered_net(_hover_net_at(screen_position))
+
+
+func _place_selected_part(screen_position: Vector2) -> void:
+	if not circuit:
+		return
+
+	var definition = _selected_part_definition()
+	if not definition:
+		return
+
+	var chip = circuit.add_chip(
+		definition,
+		_snapped_grid_position_for_definition(screen_position, definition),
+		_next_chip_label(definition)
+	)
+	if definition.id == &"toggle":
+		chip.state["on"] = false
+
+	circuit.settle()
+	circuit_interacted.emit()
+	queue_redraw()
+
+
+func _handle_wire_click(screen_position: Vector2) -> void:
+	if not circuit:
+		return
+
+	var pin_hit := _pin_at(screen_position)
+	if pin_hit.is_empty():
+		_wire_start.clear()
+		queue_redraw()
+		return
+
+	if _wire_start.is_empty():
+		_wire_start = pin_hit
+		queue_redraw()
+		return
+
+	if _same_pin_ref(_wire_start, pin_hit):
+		_wire_start.clear()
+		queue_redraw()
+		return
+
+	var net_id: int = circuit.connect_pins(
+		_wire_start["chip"],
+		_wire_start["pin"],
+		pin_hit["chip"],
+		pin_hit["pin"],
+		_next_wire_net_label()
+	)
+	_wire_start.clear()
+	if net_id >= 0:
+		circuit.settle()
+		circuit_interacted.emit()
+	queue_redraw()
+
+
+func _cancel_transient_tool_state() -> void:
+	_wire_start.clear()
+	_hovered_pin.clear()
+	_has_placement_ghost = false
+	queue_redraw()
+
+
+func _selected_part_definition():
+	if selected_part_id == &"" or not library.has(selected_part_id):
+		return null
+	return library[selected_part_id]
+
+
+func _snapped_grid_position_for_definition(screen_position: Vector2, definition) -> Vector2i:
+	var component_size := _component_size_for_definition(definition)
+	var world_top_left := _screen_to_world(screen_position) - component_size * 0.5
+	return Vector2i(
+		int(round(world_top_left.x / GRID_SPACING)),
+		int(round(world_top_left.y / GRID_SPACING))
+	)
+
+
+func _next_chip_label(definition) -> String:
+	var prefix := _chip_label_prefix(definition.id)
+	var next_number := 1
+	while _chip_label_exists("%s%d" % [prefix, next_number]):
+		next_number += 1
+	return "%s%d" % [prefix, next_number]
+
+
+func _chip_label_prefix(definition_id: StringName) -> String:
+	match definition_id:
+		&"toggle":
+			return "IN"
+		&"led":
+			return "LED"
+		&"resistor_2k2", &"resistor_220":
+			return "R"
+		&"nand", &"not", &"and", &"or", &"xor":
+			return "G"
+	return "U"
+
+
+func _chip_label_exists(label: String) -> bool:
+	if not circuit:
+		return false
+	for chip in circuit.chips:
+		if chip.label == label:
+			return true
+	return false
+
+
+func _next_wire_net_label() -> String:
+	while _net_label_exists("NET%d" % _next_wire_net_number):
+		_next_wire_net_number += 1
+
+	var label := "NET%d" % _next_wire_net_number
+	_next_wire_net_number += 1
+	return label
+
+
+func _net_label_exists(net_label: String) -> bool:
+	if not circuit:
+		return false
+	for net in circuit.nets:
+		if net.label == net_label:
+			return true
+	return false
 
 
 func _draw() -> void:
@@ -114,6 +302,11 @@ func _draw() -> void:
 			break
 	for chip in circuit.chips:
 		_draw_chip(chip)
+
+	if active_tool == TOOL_PLACE:
+		_draw_placement_ghost()
+	elif active_tool == TOOL_WIRE:
+		_draw_wire_tool_overlay()
 
 
 func _draw_grid() -> void:
@@ -948,13 +1141,61 @@ func _draw_pin(chip, pin: Dictionary) -> void:
 		draw_string(font, position + label_offset, str(pin_name), HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size, Color(0.10, 0.11, 0.10))
 
 
+func _draw_placement_ghost() -> void:
+	if not _has_placement_ghost:
+		return
+
+	var definition = _selected_part_definition()
+	if not definition:
+		return
+
+	var rect := _definition_rect(_ghost_grid_position, definition)
+	var font := get_theme_default_font()
+	var fill := Color(0.98, 0.80, 0.24, 0.20)
+	var border := Color(0.95, 0.68, 0.14, 0.88)
+	_draw_rounded_rect(_expanded_rect(rect, 4.0 * zoom), Color(fill.r, fill.g, fill.b, 0.11), Color.TRANSPARENT, 0.0, 8.0 * zoom)
+	_draw_rounded_rect(rect, fill, border, maxf(1.0, 2.0 * zoom), 6.0 * zoom)
+	_draw_centered_text(font, _inset_rect(rect, 6.0 * zoom), _definition_short_label(definition), max(10, int(13 * zoom)), Color(0.12, 0.10, 0.06))
+
+	for pin: Dictionary in definition.pins:
+		var pin_name: StringName = pin.get("name")
+		var pin_position := _pin_position_for_definition(definition, rect, pin_name)
+		draw_circle(pin_position, maxf(3.0, 4.2 * zoom), Color(0.98, 0.93, 0.72, 0.82))
+		draw_circle(pin_position, maxf(3.0, 4.2 * zoom), border.darkened(0.40), false, maxf(1.0, 1.2 * zoom))
+
+
+func _draw_wire_tool_overlay() -> void:
+	if not _wire_start.is_empty():
+		var start_position := _pin_ref_position(_wire_start)
+		var end_position := _last_mouse_screen_position
+		if not _hovered_pin.is_empty():
+			end_position = _pin_ref_position(_hovered_pin)
+
+		draw_line(start_position, end_position, Color(0.08, 0.07, 0.04, 0.36), maxf(4.0, 6.0 * zoom), true)
+		draw_line(start_position, end_position, Color(0.96, 0.72, 0.18, 0.92), maxf(2.0, 3.0 * zoom), true)
+		_draw_pin_tool_ring(_wire_start, Color(0.96, 0.72, 0.18))
+
+	if not _hovered_pin.is_empty():
+		_draw_pin_tool_ring(_hovered_pin, Color(0.23, 0.52, 0.96))
+
+
+func _draw_pin_tool_ring(pin_ref: Dictionary, color: Color) -> void:
+	var position := _pin_ref_position(pin_ref)
+	draw_circle(position, maxf(8.0, 10.0 * zoom), Color(color.r, color.g, color.b, 0.16))
+	draw_circle(position, maxf(6.0, 7.4 * zoom), color, false, maxf(1.4, 1.8 * zoom))
+
+
 func _chip_rect(chip) -> Rect2:
 	var top_left := _world_to_screen(Vector2(chip.position) * GRID_SPACING)
 	return Rect2(top_left, _component_size(chip) * zoom)
 
 
 func _component_size(chip) -> Vector2:
-	match chip.definition.id:
+	return _component_size_for_definition(chip.definition)
+
+
+func _component_size_for_definition(definition) -> Vector2:
+	match definition.id:
 		&"toggle":
 			return Vector2(58.0, 48.0)
 		&"led":
@@ -967,24 +1208,73 @@ func _component_size(chip) -> Vector2:
 			return CHIP_SIZE
 
 
+func _definition_rect(grid_position: Vector2i, definition) -> Rect2:
+	var top_left := _world_to_screen(Vector2(grid_position) * GRID_SPACING)
+	return Rect2(top_left, _component_size_for_definition(definition) * zoom)
+
+
+func _definition_short_label(definition) -> String:
+	match definition.id:
+		&"ic_7486":
+			return "74LS86"
+		&"ic_7408":
+			return "74LS08"
+		&"ic_7432":
+			return "74LS32"
+	return definition.display_name
+
+
 func _chip_at(screen_position: Vector2):
 	if not circuit:
 		return null
 
-	for chip in circuit.chips:
+	for index: int in range(circuit.chips.size() - 1, -1, -1):
+		var chip = circuit.chips[index]
 		if _chip_rect(chip).has_point(screen_position):
 			return chip
 	return null
 
 
+func _pin_at(screen_position: Vector2) -> Dictionary:
+	if not circuit:
+		return {}
+
+	var best_pin: Dictionary = {}
+	var best_distance := 1000000.0
+	var threshold := maxf(9.0, 11.0 * zoom)
+
+	for chip_index: int in range(circuit.chips.size() - 1, -1, -1):
+		var chip = circuit.chips[chip_index]
+		for pin: Dictionary in chip.definition.pins:
+			var pin_name: StringName = pin.get("name")
+			var distance := _pin_position(chip, pin_name).distance_to(screen_position)
+			if distance < best_distance:
+				best_distance = distance
+				best_pin = {"chip": chip, "pin": pin_name}
+
+	return best_pin if best_distance <= threshold else {}
+
+
+func _same_pin_ref(pin_a: Dictionary, pin_b: Dictionary) -> bool:
+	return pin_a.get("chip") == pin_b.get("chip") and pin_a.get("pin") == pin_b.get("pin")
+
+
+func _pin_ref_position(pin_ref: Dictionary) -> Vector2:
+	return _pin_position(pin_ref["chip"], pin_ref["pin"])
+
+
 func _pin_position(chip, pin_name: StringName) -> Vector2:
 	var rect: Rect2 = _chip_rect(chip)
-	var pin: Dictionary = chip.definition.get_pin(pin_name)
+	return _pin_position_for_definition(chip.definition, rect, pin_name)
+
+
+func _pin_position_for_definition(definition, rect: Rect2, pin_name: StringName) -> Vector2:
+	var pin: Dictionary = definition.get_pin(pin_name)
 	var same_side_count := 0
 	var same_side_index := 0
 	var side: StringName = pin.get("side", &"left")
 
-	for definition_pin: Dictionary in chip.definition.pins:
+	for definition_pin: Dictionary in definition.pins:
 		if definition_pin.get("side") == side:
 			if definition_pin.get("name") == pin_name:
 				same_side_index = same_side_count

@@ -6,6 +6,7 @@ A Godot 4 prototype for a digital logic construction game where players build ci
 
 - Godot main scene with a pan/zoom workbench.
 - Hardcoded demo circuit: two toggles feed a NAND gate and LED.
+- MS Paint-style toolbox for pointer, wire, and repeated chip/part placement.
 - Small simulator core for nets, signal resolution, chip definitions, and basic gates.
 - Headless simulator tests for signal resolution, gate truth tables, and bus conflicts.
 
@@ -18,4 +19,4 @@ A Godot 4 prototype for a digital logic construction game where players build ci
 
 ## Likely Next Step
 
-Turn the hardcoded demo into the first editable action: select a component from a small parts drawer and place it on the workbench grid.
+Add direct manipulation for placed parts: select, drag/snap, delete, and undo basic edits.

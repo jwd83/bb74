@@ -5,6 +5,26 @@ const CircuitScript = preload("res://scripts/sim/circuit.gd")
 const SignalValue = preload("res://scripts/sim/signal_value.gd")
 const WorkbenchViewScript = preload("res://scripts/ui/workbench_view.gd")
 
+const TOOL_SELECT := &"select"
+const TOOL_WIRE := &"wire"
+const TOOL_PLACE := &"place"
+const TOOL_BUTTONS := [
+	{"id": TOOL_SELECT, "label": "P", "tooltip": "Pointer"},
+	{"id": TOOL_WIRE, "label": "W", "tooltip": "Wire"},
+]
+const PART_BUTTONS := [
+	{"id": &"toggle", "label": "SW", "tooltip": "Pushbutton"},
+	{"id": &"led", "label": "LED", "tooltip": "LED"},
+	{"id": &"ic_7486", "label": "86", "tooltip": "74LS86 XOR"},
+	{"id": &"ic_7408", "label": "08", "tooltip": "74LS08 AND"},
+	{"id": &"ic_7432", "label": "32", "tooltip": "74LS32 OR"},
+	{"id": &"nand", "label": "00", "tooltip": "7400 NAND"},
+	{"id": &"not", "label": "04", "tooltip": "7404 NOT"},
+	{"id": &"resistor_220", "label": "220", "tooltip": "220 ohm resistor"},
+	{"id": &"resistor_2k2", "label": "2K", "tooltip": "2.2K resistor"},
+]
+
+var _library: Dictionary = {}
 var _circuit
 var _workbench
 var _status_label: Label
@@ -12,6 +32,10 @@ var _case_label: Label
 var _result_label: Label
 var _net_pills: Array[Label] = []
 var _truth_buttons: Array[Button] = []
+var _tool_buttons: Dictionary = {}
+var _part_buttons: Dictionary = {}
+var _active_tool: StringName = TOOL_SELECT
+var _active_part_id: StringName = &""
 var _watched_nets: Array[String] = ["A", "B", "Cin", "SUM", "Cout"]
 var _case_index := 0
 var _verified_rows: Dictionary = {}
@@ -28,9 +52,12 @@ var _truth_rows: Array[Dictionary] = [
 
 
 func _ready() -> void:
+	_library = BuiltinChipsScript.create_standard_library()
 	_build_ui()
 	_circuit = _create_full_adder_circuit()
+	_workbench.set_library(_library)
 	_workbench.set_circuit(_circuit)
+	_select_tool(TOOL_SELECT)
 	_circuit.changed.connect(_update_status)
 	_circuit.settle()
 	_update_status()
@@ -92,6 +119,8 @@ func _build_ui() -> void:
 	lab_body.add_theme_constant_override("separation", 0)
 	root.add_child(lab_body)
 
+	lab_body.add_child(_build_toolbox())
+
 	_workbench = WorkbenchViewScript.new()
 	_workbench.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_workbench.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -117,6 +146,81 @@ func _build_ui() -> void:
 	_status_label.add_theme_font_size_override("font_size", 13)
 	_status_label.add_theme_color_override("font_color", Color(0.87, 0.84, 0.74))
 	status_margin.add_child(_status_label)
+
+
+func _build_toolbox() -> Control:
+	var panel := PanelContainer.new()
+	panel.custom_minimum_size = Vector2(104.0, 0.0)
+	panel.add_theme_stylebox_override("panel", _make_style_box(Color(0.16, 0.16, 0.14), Color(0.07, 0.06, 0.05), 0, 0))
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 8)
+	margin.add_theme_constant_override("margin_top", 10)
+	margin.add_theme_constant_override("margin_right", 8)
+	margin.add_theme_constant_override("margin_bottom", 10)
+	panel.add_child(margin)
+
+	var stack := VBoxContainer.new()
+	stack.add_theme_constant_override("separation", 8)
+	margin.add_child(stack)
+
+	stack.add_child(_make_toolbox_header("TOOLS"))
+	var tool_grid := GridContainer.new()
+	tool_grid.columns = 2
+	tool_grid.add_theme_constant_override("h_separation", 6)
+	tool_grid.add_theme_constant_override("v_separation", 6)
+	stack.add_child(tool_grid)
+
+	_tool_buttons.clear()
+	for tool: Dictionary in TOOL_BUTTONS:
+		var button := _make_toolbox_button(tool["label"], tool["tooltip"])
+		button.pressed.connect(_on_tool_button_pressed.bind(tool["id"]))
+		tool_grid.add_child(button)
+		_tool_buttons[tool["id"]] = button
+
+	stack.add_child(_make_toolbox_header("PARTS"))
+	var part_grid := GridContainer.new()
+	part_grid.columns = 2
+	part_grid.add_theme_constant_override("h_separation", 6)
+	part_grid.add_theme_constant_override("v_separation", 6)
+	stack.add_child(part_grid)
+
+	_part_buttons.clear()
+	for part: Dictionary in PART_BUTTONS:
+		if not _library.has(part["id"]):
+			continue
+		var button := _make_toolbox_button(part["label"], part["tooltip"])
+		button.pressed.connect(_on_part_button_pressed.bind(part["id"]))
+		part_grid.add_child(button)
+		_part_buttons[part["id"]] = button
+
+	return panel
+
+
+func _make_toolbox_header(text: String) -> Label:
+	var label := Label.new()
+	label.text = text
+	label.add_theme_font_size_override("font_size", 11)
+	label.add_theme_color_override("font_color", Color(0.72, 0.70, 0.61))
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	return label
+
+
+func _make_toolbox_button(label: String, tooltip: String) -> Button:
+	var button := Button.new()
+	button.text = label
+	button.tooltip_text = tooltip
+	button.toggle_mode = true
+	button.focus_mode = Control.FOCUS_NONE
+	button.custom_minimum_size = Vector2(40.0, 38.0)
+	button.add_theme_font_size_override("font_size", 12)
+	button.add_theme_color_override("font_color", Color(0.92, 0.90, 0.80))
+	button.add_theme_color_override("font_hover_color", Color(1.0, 0.98, 0.88))
+	button.add_theme_color_override("font_pressed_color", Color(0.10, 0.09, 0.06))
+	button.add_theme_stylebox_override("normal", _make_style_box(Color(0.23, 0.23, 0.20), Color(0.40, 0.38, 0.31), 1, 4))
+	button.add_theme_stylebox_override("hover", _make_style_box(Color(0.30, 0.30, 0.25), Color(0.78, 0.65, 0.31), 1, 4))
+	button.add_theme_stylebox_override("pressed", _make_style_box(Color(0.94, 0.74, 0.24), Color(0.98, 0.88, 0.48), 1, 4))
+	return button
 
 
 func _build_lab_panel() -> Control:
@@ -188,7 +292,7 @@ func _build_lab_panel() -> Control:
 
 
 func _create_full_adder_circuit():
-	var library := BuiltinChipsScript.create_standard_library()
+	var library: Dictionary = _library if not _library.is_empty() else BuiltinChipsScript.create_standard_library()
 	var circuit := CircuitScript.new()
 
 	var input_cin = circuit.add_chip(library[&"toggle"], Vector2i(-25, -6), "Cin")
@@ -266,6 +370,33 @@ func _create_full_adder_circuit():
 	return circuit
 
 
+func _on_tool_button_pressed(tool_id: StringName) -> void:
+	_select_tool(tool_id)
+
+
+func _on_part_button_pressed(part_id: StringName) -> void:
+	_select_tool(TOOL_PLACE, part_id)
+
+
+func _select_tool(tool_id: StringName, part_id: StringName = &"") -> void:
+	_active_tool = tool_id
+	_active_part_id = part_id
+	if _workbench:
+		_workbench.set_active_tool(_active_tool, _active_part_id)
+	_update_tool_button_states()
+	_update_status()
+
+
+func _update_tool_button_states() -> void:
+	for tool_id in _tool_buttons.keys():
+		var button: Button = _tool_buttons[tool_id]
+		button.set_pressed_no_signal(_active_tool == tool_id and _active_part_id == &"")
+
+	for part_id in _part_buttons.keys():
+		var button: Button = _part_buttons[part_id]
+		button.set_pressed_no_signal(_active_tool == TOOL_PLACE and _active_part_id == part_id)
+
+
 func _on_settle_pressed() -> void:
 	_circuit.settle()
 	_update_status()
@@ -329,7 +460,13 @@ func _update_status() -> void:
 	var current_row: Dictionary = _truth_rows[_case_index]
 	var expected := "expected SUM=%s Cout=%s" % [_bit_label(current_row["sum"]), _bit_label(current_row["cout"])]
 	var result_text := "MATCH" if _current_row_matches(_case_index) else "CHECK"
-	_status_label.text = "Case %d/%d  %s  %s" % [_case_index + 1, _truth_rows.size(), expected, "  ".join(parts)]
+	_status_label.text = "Tool %s  Case %d/%d  %s  %s" % [
+		_active_tool_label(),
+		_case_index + 1,
+		_truth_rows.size(),
+		expected,
+		"  ".join(parts),
+	]
 
 	if _case_label:
 		_case_label.text = "CASE %d/%d" % [_case_index + 1, _truth_rows.size()]
@@ -339,6 +476,14 @@ func _update_status() -> void:
 		var result_border := Color(0.36, 0.76, 0.30) if result_text == "MATCH" else Color(0.92, 0.70, 0.23)
 		_result_label.add_theme_stylebox_override("normal", _make_style_box(result_color, result_border, 1, 6))
 	_update_truth_table_styles()
+
+
+func _active_tool_label() -> String:
+	if _active_tool == TOOL_PLACE and _library.has(_active_part_id):
+		return _library[_active_part_id].display_name
+	if _active_tool == TOOL_WIRE:
+		return "Wire"
+	return "Pointer"
 
 
 func _net_by_label(net_label: String):
