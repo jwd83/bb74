@@ -5,8 +5,10 @@ A Godot 4 prototype for a digital logic construction game where players build ci
 ## Current Slice
 
 - Godot main scene with a pan/zoom workbench.
-- Hardcoded demo circuit: two toggles feed a NAND gate and LED.
+- Selectable level presets: NAND starter, half adder, full adder, and sandbox.
 - MS Paint-style toolbox for pointer, wire, and repeated chip/part placement.
+- Real 74LS DIP pinouts for NAND, NOT, AND, OR, and XOR chips; IC outputs require VCC on pin 14 and GND on pin 7.
+- Breadboard terminal strips and rails are represented as passive bus members inside nets; manual jumper wires snap to pins, terminal strips, and power rails.
 - Small simulator core for nets, signal resolution, chip definitions, and basic gates.
 - Headless simulator tests for signal resolution, gate truth tables, and bus conflicts.
 
@@ -19,4 +21,4 @@ A Godot 4 prototype for a digital logic construction game where players build ci
 
 ## Likely Next Step
 
-Add direct manipulation for placed parts: select, drag/snap, delete, and undo basic edits.
+Give two-pin parts independent breadboard leg placement so LEDs and resistors can span real rows cleanly in sandbox builds.

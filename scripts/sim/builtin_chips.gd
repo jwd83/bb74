@@ -22,54 +22,33 @@ static func create_standard_library() -> Dictionary:
 			],
 			Color(0.28, 0.16, 0.14)
 		),
-		&"nand": ChipDefinitionScript.new(
-			&"nand",
-			"7400 NAND",
+		&"power_5v": ChipDefinitionScript.new(
+			&"power_5v",
+			"5V",
 			[
-				{"name": &"A", "direction": &"in", "side": &"left"},
-				{"name": &"B", "direction": &"in", "side": &"left"},
-				{"name": &"Y", "direction": &"out", "side": &"right"},
+				{"name": &"OUT", "direction": &"out", "side": &"right"},
 			],
-			Color(0.14, 0.16, 0.18)
+			Color(0.70, 0.06, 0.05)
 		),
-		&"not": ChipDefinitionScript.new(
-			&"not",
-			"7404 NOT",
+		&"ground": ChipDefinitionScript.new(
+			&"ground",
+			"GND",
 			[
-				{"name": &"A", "direction": &"in", "side": &"left"},
-				{"name": &"Y", "direction": &"out", "side": &"right"},
+				{"name": &"OUT", "direction": &"out", "side": &"right"},
 			],
-			Color(0.15, 0.17, 0.19)
+			Color(0.05, 0.05, 0.045)
 		),
-		&"and": ChipDefinitionScript.new(
-			&"and",
-			"7408 AND",
-			[
-				{"name": &"A", "direction": &"in", "side": &"left"},
-				{"name": &"B", "direction": &"in", "side": &"left"},
-				{"name": &"Y", "direction": &"out", "side": &"right"},
-			],
-			Color(0.15, 0.17, 0.19)
+		&"ic_7400": ChipDefinitionScript.new(
+			&"ic_7400",
+			"74LS00 NAND",
+			_dip14_quad_gate_pins(),
+			Color(0.03, 0.035, 0.032)
 		),
-		&"or": ChipDefinitionScript.new(
-			&"or",
-			"7432 OR",
-			[
-				{"name": &"A", "direction": &"in", "side": &"left"},
-				{"name": &"B", "direction": &"in", "side": &"left"},
-				{"name": &"Y", "direction": &"out", "side": &"right"},
-			],
-			Color(0.15, 0.17, 0.19)
-		),
-		&"xor": ChipDefinitionScript.new(
-			&"xor",
-			"7486 XOR",
-			[
-				{"name": &"A", "direction": &"in", "side": &"left"},
-				{"name": &"B", "direction": &"in", "side": &"left"},
-				{"name": &"Y", "direction": &"out", "side": &"right"},
-			],
-			Color(0.15, 0.17, 0.19)
+		&"ic_7404": ChipDefinitionScript.new(
+			&"ic_7404",
+			"74LS04 NOT",
+			_dip14_hex_inverter_pins(),
+			Color(0.03, 0.035, 0.032)
 		),
 		&"ic_7486": ChipDefinitionScript.new(
 			&"ic_7486",
@@ -116,9 +95,41 @@ static func _dip14_quad_gate_pins() -> Array[Dictionary]:
 
 	for pin_number: int in range(1, 8):
 		var pin_name := StringName(str(pin_number))
+		var direction := &"out" if output_pins.has(pin_name) else &"in"
+		if pin_number == 7:
+			direction = &"ground"
 		pins.append({
 			"name": pin_name,
-			"direction": &"out" if output_pins.has(pin_name) else &"in",
+			"direction": direction,
+			"side": &"bottom",
+		})
+
+	for pin_number: int in range(14, 7, -1):
+		var pin_name := StringName(str(pin_number))
+		var direction := &"out" if output_pins.has(pin_name) else &"in"
+		if pin_number == 14:
+			direction = &"power"
+		pins.append({
+			"name": pin_name,
+			"direction": direction,
+			"side": &"top",
+		})
+
+	return pins
+
+
+static func _dip14_hex_inverter_pins() -> Array[Dictionary]:
+	var pins: Array[Dictionary] = []
+	var output_pins := [&"2", &"4", &"6", &"8", &"10", &"12"]
+
+	for pin_number: int in range(1, 8):
+		var pin_name := StringName(str(pin_number))
+		var direction := &"out" if output_pins.has(pin_name) else &"in"
+		if pin_number == 7:
+			direction = &"ground"
+		pins.append({
+			"name": pin_name,
+			"direction": direction,
 			"side": &"bottom",
 		})
 

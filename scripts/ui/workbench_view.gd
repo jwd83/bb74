@@ -7,7 +7,19 @@ signal circuit_interacted
 
 const CHIP_SIZE := Vector2(124.0, 70.0)
 const GRID_SPACING := 20.0
-const BOARD_GRID_RECT := Rect2(Vector2(-29.5, -9.0), Vector2(59.0, 18.0))
+const BOARD_GRID_RECT := Rect2(Vector2(-30.0, -11.5), Vector2(60.0, 23.0))
+const BREADBOARD_COLUMNS := 52
+const RAIL_HOLE_COUNT := 52
+const BREADBOARD_COLUMN_LEFT := 90.0
+const BREADBOARD_HOLE_PITCH := 20.0
+const BREADBOARD_TOP_PLUS_Y := 42.0
+const BREADBOARD_TOP_MINUS_Y := 74.0
+const BREADBOARD_TOP_TERMINAL_Y := 134.0
+const BREADBOARD_BOTTOM_TERMINAL_Y := 254.0
+const BREADBOARD_BOTTOM_PLUS_Y := 398.0
+const BREADBOARD_BOTTOM_MINUS_Y := 430.0
+const DIP_PIN_SPACING := 20.0
+const DIP_VISUAL_SIZE := Vector2(160.0, 92.0)
 const DEFAULT_PAN := Vector2(0.0, -72.0)
 const TOOL_SELECT := &"select"
 const TOOL_WIRE := &"wire"
@@ -33,6 +45,7 @@ var _last_mouse_position := Vector2.ZERO
 var _last_mouse_screen_position := Vector2.ZERO
 var _hovered_net_id := -1
 var _hovered_pin: Dictionary = {}
+var _hovered_bus: Dictionary = {}
 var _wire_start: Dictionary = {}
 var _has_placement_ghost := false
 var _ghost_grid_position := Vector2i.ZERO
@@ -50,6 +63,7 @@ func set_circuit(next_circuit) -> void:
 	circuit = next_circuit
 	_hovered_net_id = -1
 	_hovered_pin.clear()
+	_hovered_bus.clear()
 	_wire_start.clear()
 	if circuit:
 		circuit.changed.connect(queue_redraw)
@@ -66,6 +80,7 @@ func set_active_tool(tool_mode: StringName, part_id: StringName = &"") -> void:
 	selected_part_id = part_id
 	_wire_start.clear()
 	_hovered_pin.clear()
+	_hovered_bus.clear()
 	_has_placement_ghost = false
 	_set_hovered_net(-1)
 	queue_redraw()
@@ -127,6 +142,7 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_MOUSE_EXIT:
 		_set_hovered_net(-1)
 		_hovered_pin.clear()
+		_hovered_bus.clear()
 		_has_placement_ghost = false
 		queue_redraw()
 
@@ -147,14 +163,17 @@ func _update_tool_hover(screen_position: Vector2) -> void:
 			if definition:
 				_ghost_grid_position = _snapped_grid_position_for_definition(screen_position, definition)
 			_hovered_pin.clear()
+			_hovered_bus.clear()
 			_set_hovered_net(-1)
 			queue_redraw()
 		TOOL_WIRE:
 			_hovered_pin = _pin_at(screen_position)
-			_set_hovered_net(-1 if not _hovered_pin.is_empty() else _hover_net_at(screen_position))
+			_hovered_bus = {} if not _hovered_pin.is_empty() else _breadboard_bus_at(screen_position)
+			_set_hovered_net(-1 if not _hovered_pin.is_empty() or not _hovered_bus.is_empty() else _hover_net_at(screen_position))
 			queue_redraw()
 		_:
 			_hovered_pin.clear()
+			_hovered_bus.clear()
 			_has_placement_ghost = false
 			_set_hovered_net(_hover_net_at(screen_position))
 
@@ -172,6 +191,7 @@ func _place_selected_part(screen_position: Vector2) -> void:
 		_snapped_grid_position_for_definition(screen_position, definition),
 		_next_chip_label(definition)
 	)
+	_snap_new_chip_to_breadboard(chip, definition, screen_position)
 	if definition.id == &"toggle":
 		chip.state["on"] = false
 
@@ -184,29 +204,23 @@ func _handle_wire_click(screen_position: Vector2) -> void:
 	if not circuit:
 		return
 
-	var pin_hit := _pin_at(screen_position)
-	if pin_hit.is_empty():
+	var endpoint := _wire_endpoint_at(screen_position)
+	if endpoint.is_empty():
 		_wire_start.clear()
 		queue_redraw()
 		return
 
 	if _wire_start.is_empty():
-		_wire_start = pin_hit
+		_wire_start = endpoint
 		queue_redraw()
 		return
 
-	if _same_pin_ref(_wire_start, pin_hit):
+	if _same_wire_endpoint(_wire_start, endpoint):
 		_wire_start.clear()
 		queue_redraw()
 		return
 
-	var net_id: int = circuit.connect_pins(
-		_wire_start["chip"],
-		_wire_start["pin"],
-		pin_hit["chip"],
-		pin_hit["pin"],
-		_next_wire_net_label()
-	)
+	var net_id: int = _connect_wire_endpoints(_wire_start, endpoint)
 	_wire_start.clear()
 	if net_id >= 0:
 		circuit.settle()
@@ -214,9 +228,55 @@ func _handle_wire_click(screen_position: Vector2) -> void:
 	queue_redraw()
 
 
+func _wire_endpoint_at(screen_position: Vector2) -> Dictionary:
+	var pin_hit := _pin_at(screen_position)
+	if not pin_hit.is_empty():
+		var endpoint := {
+			"type": &"pin",
+			"chip": pin_hit["chip"],
+			"pin": pin_hit["pin"],
+			"position": _pin_ref_position(pin_hit),
+		}
+		var pin_bus_id := _pin_breadboard_bus_id(pin_hit["chip"], pin_hit["pin"])
+		if not pin_bus_id.is_empty():
+			endpoint["bus"] = pin_bus_id
+		return endpoint
+
+	return _breadboard_bus_at(screen_position)
+
+
+func _connect_wire_endpoints(start: Dictionary, end: Dictionary) -> int:
+	var net_label := _next_wire_net_label()
+	var net_id := -1
+	var start_type: StringName = start.get("type", &"")
+	var end_type: StringName = end.get("type", &"")
+
+	if start_type == &"pin" and end_type == &"pin":
+		net_id = circuit.connect_pins(start["chip"], start["pin"], end["chip"], end["pin"], net_label)
+	elif start_type == &"pin" and end_type == &"bus":
+		net_id = circuit.connect_pin_to_bus(start["chip"], start["pin"], end["bus"], net_label)
+	elif start_type == &"bus" and end_type == &"pin":
+		net_id = circuit.connect_pin_to_bus(end["chip"], end["pin"], start["bus"], net_label)
+	elif start_type == &"bus" and end_type == &"bus":
+		net_id = circuit.connect_buses(start["bus"], end["bus"], net_label)
+
+	if net_id >= 0:
+		_connect_endpoint_local_bus(start, net_id)
+		_connect_endpoint_local_bus(end, net_id)
+	return net_id
+
+
+func _connect_endpoint_local_bus(endpoint: Dictionary, net_id: int) -> void:
+	var bus_id: String = endpoint.get("bus", "")
+	if bus_id.is_empty():
+		return
+	circuit.connect_bus_to_net(bus_id, net_id)
+
+
 func _cancel_transient_tool_state() -> void:
 	_wire_start.clear()
 	_hovered_pin.clear()
+	_hovered_bus.clear()
 	_has_placement_ghost = false
 	queue_redraw()
 
@@ -225,6 +285,48 @@ func _selected_part_definition():
 	if selected_part_id == &"" or not library.has(selected_part_id):
 		return null
 	return library[selected_part_id]
+
+
+func _snap_new_chip_to_breadboard(chip, definition, screen_position: Vector2) -> void:
+	if _is_dip_definition(definition):
+		var column := clampi(_nearest_breadboard_column(screen_position) - 3, 0, BREADBOARD_COLUMNS - 7)
+		chip.state["dip_origin_column"] = column
+		return
+
+	var first_pin_name: StringName = definition.pins[0].get("name")
+	var hole := _nearest_breadboard_hole(screen_position)
+	if not hole.is_empty():
+		chip.state["pin_holes"] = {
+			str(first_pin_name): hole,
+		}
+
+
+func _is_dip_definition(definition) -> bool:
+	return definition.id in [&"ic_7400", &"ic_7404", &"ic_7486", &"ic_7408", &"ic_7432"]
+
+
+func _nearest_breadboard_column(screen_position: Vector2) -> int:
+	var best_column := 0
+	var best_distance := 1000000.0
+	for column: int in range(BREADBOARD_COLUMNS):
+		for row_index: int in range(10):
+			var distance := _breadboard_hole_screen_position(column, row_index).distance_squared_to(screen_position)
+			if distance < best_distance:
+				best_distance = distance
+				best_column = column
+	return best_column
+
+
+func _nearest_breadboard_hole(screen_position: Vector2) -> Dictionary:
+	var best := {}
+	var best_distance := 1000000.0
+	for column: int in range(BREADBOARD_COLUMNS):
+		for row_index: int in range(10):
+			var distance := _breadboard_hole_screen_position(column, row_index).distance_squared_to(screen_position)
+			if distance < best_distance:
+				best_distance = distance
+				best = {"column": column, "row": row_index}
+	return best
 
 
 func _snapped_grid_position_for_definition(screen_position: Vector2, definition) -> Vector2i:
@@ -246,14 +348,16 @@ func _next_chip_label(definition) -> String:
 
 func _chip_label_prefix(definition_id: StringName) -> String:
 	match definition_id:
+		&"power_5v":
+			return "5V"
+		&"ground":
+			return "GND"
 		&"toggle":
 			return "IN"
 		&"led":
 			return "LED"
 		&"resistor_2k2", &"resistor_220":
 			return "R"
-		&"nand", &"not", &"and", &"or", &"xor":
-			return "G"
 	return "U"
 
 
@@ -353,81 +457,89 @@ func _draw_bb830_labels(board_rect: Rect2) -> void:
 	var dark := Color(0.12, 0.12, 0.105, 0.86)
 	var red := Color(0.72, 0.07, 0.06)
 	var row_letters := ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
-	var x_left := board_rect.position.x + 28.0 * zoom
-	var x_right := board_rect.end.x - 38.0 * zoom
+	var x_left := _bb830_column_x(board_rect, 0) - 36.0 * zoom
+	var x_right := _bb830_column_x(board_rect, BREADBOARD_COLUMNS - 1) + 24.0 * zoom
+	var rail_label_x := board_rect.position.x + 20.0 * zoom
 
-	draw_string(font, board_rect.position + Vector2(20.0, 35.0) * zoom, "+", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(16, int(24 * zoom)), red)
-	draw_string(font, board_rect.position + Vector2(20.0, 82.0) * zoom, "-", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(14, int(21 * zoom)), dark)
-	draw_string(font, board_rect.position + Vector2(20.0, board_rect.size.y - 78.0 * zoom), "+", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(16, int(24 * zoom)), red)
-	draw_string(font, board_rect.position + Vector2(20.0, board_rect.size.y - 30.0 * zoom), "-", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(14, int(21 * zoom)), dark)
-	draw_string(font, board_rect.position + Vector2(18.0, board_rect.size.y * 0.52), "BB830", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(10, int(15 * zoom)), dark)
+	draw_string(font, Vector2(rail_label_x, _bb830_rail_y(board_rect, "top", "plus") + 8.0 * zoom), "+", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(16, int(24 * zoom)), red)
+	draw_string(font, Vector2(rail_label_x, _bb830_rail_y(board_rect, "top", "minus") + 8.0 * zoom), "-", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(14, int(21 * zoom)), dark)
+	draw_string(font, Vector2(rail_label_x, _bb830_rail_y(board_rect, "bottom", "plus") + 8.0 * zoom), "+", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(16, int(24 * zoom)), red)
+	draw_string(font, Vector2(rail_label_x, _bb830_rail_y(board_rect, "bottom", "minus") + 8.0 * zoom), "-", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(14, int(21 * zoom)), dark)
+	draw_string(font, Vector2(board_rect.position.x + 18.0 * zoom, _bb830_center_groove_y(board_rect) + 6.0 * zoom), "BB830", HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(10, int(15 * zoom)), dark)
 
 	for index: int in range(row_letters.size()):
 		var row_y := _bb830_row_y(board_rect, index)
 		draw_string(font, Vector2(x_left, row_y + 4.0 * zoom), row_letters[index], HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(8, int(10 * zoom)), dark)
 		draw_string(font, Vector2(x_right, row_y + 4.0 * zoom), row_letters[index], HORIZONTAL_ALIGNMENT_LEFT, -1.0, max(8, int(10 * zoom)), dark)
 
-	var numbers := [60, 55, 50, 45, 40, 35, 30, 25, 20]
-	for index: int in range(numbers.size()):
-		var x := board_rect.position.x + (120.0 + index * 112.0) * zoom
-		var label := str(numbers[index])
-		draw_string(font, Vector2(x, board_rect.position.y + 138.0 * zoom), label, HORIZONTAL_ALIGNMENT_CENTER, 30.0 * zoom, max(10, int(16 * zoom)), dark)
-		draw_string(font, Vector2(x, board_rect.end.y - 92.0 * zoom), label, HORIZONTAL_ALIGNMENT_CENTER, 30.0 * zoom, max(10, int(16 * zoom)), dark)
+	var label_columns := [0, 4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 51]
+	for column in label_columns:
+		var x := _bb830_column_x(board_rect, int(column))
+		var label := str(int(column) + 1)
+		draw_string(font, Vector2(x, _bb830_row_y(board_rect, 0) - 25.0 * zoom), label, HORIZONTAL_ALIGNMENT_CENTER, 34.0 * zoom, max(8, int(12 * zoom)), dark)
+		draw_string(font, Vector2(x, _bb830_row_y(board_rect, 9) + 35.0 * zoom), label, HORIZONTAL_ALIGNMENT_CENTER, 34.0 * zoom, max(8, int(12 * zoom)), dark)
 
 
 func _draw_bb830_rails(board_rect: Rect2) -> void:
-	var rail_left := board_rect.position.x + 68.0 * zoom
-	var rail_right := board_rect.end.x - 48.0 * zoom
 	var rail_width := maxf(1.6, 2.3 * zoom)
 	var red := Color(0.75, 0.09, 0.07, 0.85)
 	var black := Color(0.06, 0.06, 0.055, 0.92)
-
-	var rail_ys := [
-		board_rect.position.y + 34.0 * zoom,
-		board_rect.position.y + 80.0 * zoom,
-		board_rect.end.y - 80.0 * zoom,
-		board_rect.end.y - 34.0 * zoom,
+	var rail_specs := [
+		{"side": "top", "polarity": "plus", "color": red},
+		{"side": "top", "polarity": "minus", "color": black},
+		{"side": "bottom", "polarity": "plus", "color": red},
+		{"side": "bottom", "polarity": "minus", "color": black},
 	]
-	var rail_colors := [red, black, red, black]
 
-	for index: int in range(rail_ys.size()):
-		draw_line(Vector2(rail_left, rail_ys[index]), Vector2(rail_right, rail_ys[index]), rail_colors[index], rail_width, true)
-		_draw_rail_holes(rail_left, rail_right, rail_ys[index], rail_colors[index])
+	for rail: Dictionary in rail_specs:
+		var rail_points := _rail_bus_points(board_rect, rail["side"], rail["polarity"])
+		if rail_points.is_empty():
+			continue
+
+		var accent: Color = rail["color"]
+		draw_line(rail_points[0], rail_points[rail_points.size() - 1], accent, rail_width, true)
+		for point: Vector2 in rail_points:
+			_draw_breadboard_hole(point, accent)
 
 
 func _draw_bb830_terminal_strips(board_rect: Rect2) -> void:
-	var columns := 52
-	var hole_gap := (board_rect.size.x - 176.0 * zoom) / float(columns - 1)
-	var start_x := board_rect.position.x + 92.0 * zoom
+	_draw_bb830_terminal_band(board_rect, 0, 4)
+	_draw_bb830_terminal_band(board_rect, 5, 9)
 
-	for column: int in range(columns):
-		var x := start_x + hole_gap * column
+	for column: int in range(BREADBOARD_COLUMNS):
+		var x := _bb830_column_x(board_rect, column)
 		for row: int in range(5):
 			_draw_breadboard_hole(Vector2(x, _bb830_row_y(board_rect, row)))
 			_draw_breadboard_hole(Vector2(x, _bb830_row_y(board_rect, row + 5)))
 
-	var groove_y := board_rect.position.y + board_rect.size.y * 0.5
+	var groove_y := _bb830_center_groove_y(board_rect)
 	draw_line(
-		Vector2(board_rect.position.x + 72.0 * zoom, groove_y),
-		Vector2(board_rect.end.x - 50.0 * zoom, groove_y),
+		Vector2(_bb830_column_x(board_rect, 0) - 24.0 * zoom, groove_y),
+		Vector2(_bb830_column_x(board_rect, BREADBOARD_COLUMNS - 1) + 24.0 * zoom, groove_y),
 		Color(0.55, 0.55, 0.50, 0.45),
-		maxf(2.0, 5.0 * zoom),
+		maxf(2.0, 9.0 * zoom),
 		true
 	)
 	draw_line(
-		Vector2(board_rect.position.x + 72.0 * zoom, groove_y),
-		Vector2(board_rect.end.x - 50.0 * zoom, groove_y),
+		Vector2(_bb830_column_x(board_rect, 0) - 24.0 * zoom, groove_y - 3.0 * zoom),
+		Vector2(_bb830_column_x(board_rect, BREADBOARD_COLUMNS - 1) + 24.0 * zoom, groove_y - 3.0 * zoom),
 		Color(0.98, 0.98, 0.94, 0.68),
 		maxf(1.0, 1.2 * zoom),
 		true
 	)
 
 
-func _draw_rail_holes(left: float, right: float, y: float, accent: Color) -> void:
-	var count := 41
-	var gap := (right - left) / float(count - 1)
-	for index: int in range(count):
-		_draw_breadboard_hole(Vector2(left + gap * index, y), accent)
+func _draw_bb830_terminal_band(board_rect: Rect2, first_row: int, last_row: int) -> void:
+	var first_y := _bb830_row_y(board_rect, first_row)
+	var last_y := _bb830_row_y(board_rect, last_row)
+	var band_rect := Rect2(
+		Vector2(_bb830_column_x(board_rect, 0) - 17.0 * zoom, first_y - 15.0 * zoom),
+		Vector2(
+			_bb830_column_x(board_rect, BREADBOARD_COLUMNS - 1) - _bb830_column_x(board_rect, 0) + 34.0 * zoom,
+			last_y - first_y + 30.0 * zoom
+		)
+	)
+	_draw_rounded_rect(band_rect, Color(0.91, 0.91, 0.86, 0.64), Color(0.78, 0.77, 0.69, 0.48), 1.0 * zoom, 7.0 * zoom)
 
 
 func _draw_breadboard_hole(position: Vector2, accent: Color = Color(0.53, 0.53, 0.49)) -> void:
@@ -438,12 +550,27 @@ func _draw_breadboard_hole(position: Vector2, accent: Color = Color(0.53, 0.53, 
 
 
 func _bb830_row_y(board_rect: Rect2, row_index: int) -> float:
-	var top_rows_start := board_rect.position.y + 126.0 * zoom
-	var bottom_rows_start := board_rect.position.y + 228.0 * zoom
-	var row_gap := 20.0 * zoom
 	if row_index < 5:
-		return top_rows_start + row_gap * row_index
-	return bottom_rows_start + row_gap * (row_index - 5)
+		return board_rect.position.y + (BREADBOARD_TOP_TERMINAL_Y + BREADBOARD_HOLE_PITCH * row_index) * zoom
+	return board_rect.position.y + (BREADBOARD_BOTTOM_TERMINAL_Y + BREADBOARD_HOLE_PITCH * (row_index - 5)) * zoom
+
+
+func _bb830_column_x(board_rect: Rect2, column: int) -> float:
+	return board_rect.position.x + (BREADBOARD_COLUMN_LEFT + BREADBOARD_HOLE_PITCH * column) * zoom
+
+
+func _bb830_center_groove_y(board_rect: Rect2) -> float:
+	return (_bb830_row_y(board_rect, 4) + _bb830_row_y(board_rect, 5)) * 0.5
+
+
+func _bb830_rail_y(board_rect: Rect2, side: String, polarity: String) -> float:
+	if side == "top" and polarity == "minus":
+		return board_rect.position.y + BREADBOARD_TOP_MINUS_Y * zoom
+	if side == "bottom" and polarity == "plus":
+		return board_rect.position.y + BREADBOARD_BOTTOM_PLUS_Y * zoom
+	if side == "bottom" and polarity == "minus":
+		return board_rect.position.y + BREADBOARD_BOTTOM_MINUS_Y * zoom
+	return board_rect.position.y + BREADBOARD_TOP_PLUS_Y * zoom
 
 
 func _draw_power_rail(rect: Rect2, title: String, subtitle: String, accent: Color) -> void:
@@ -523,23 +650,23 @@ func _draw_net(net) -> void:
 		return
 
 	var connections: Array[Dictionary] = _net_connections(net)
+	if connections.size() < 2:
+		return
+
 	var highlighted: bool = net.id == _hovered_net_id
 	var color := _wire_color_for_net(net)
 	if highlighted:
 		color = color.lightened(0.22)
 	var line_width: float = maxf(2.8, 4.2 * zoom) * (1.45 if highlighted else 1.0)
-	if _is_power_net(net.label):
-		_draw_power_net(net.label, connections, color, line_width, highlighted)
-	elif _uses_breadboard_bus(net.label, connections):
-		_draw_bus_net(net.label, connections, color, line_width, highlighted)
-	else:
-		var points: Array[Vector2] = []
-		for connection: Dictionary in connections:
-			points.append(connection["position"])
 
-		var wire_count: int = points.size() - 1
-		for index in range(1, points.size()):
-			_draw_wire(points[0], points[index], color, line_width, net.label, index, wire_count, highlighted)
+	for connection: Dictionary in connections:
+		if connection.has("bus"):
+			_draw_bus_connection(connection, color, highlighted)
+
+	var segments := _net_wire_segments(connections, net.label)
+	for index: int in range(segments.size()):
+		var segment: Dictionary = segments[index]
+		_draw_wire(segment["start"], segment["end"], color, line_width, net.label, index + 1, segments.size(), highlighted)
 
 	if highlighted or (_should_label_net(net.label) and zoom >= 1.18):
 		var points: Array[Vector2] = []
@@ -555,84 +682,332 @@ func _draw_net(net) -> void:
 		draw_string(font, label_rect.position + Vector2(8.0 * zoom, label_rect.size.y * 0.5 + font_size * 0.34), text, HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size, Color(0.96, 0.95, 0.88))
 
 
-func _draw_bus_net(net_label: String, connections: Array[Dictionary], color: Color, line_width: float, highlighted: bool) -> void:
-	var driver := _first_driver_connection(connections)
-	var loads: Array[Dictionary] = []
+func _net_wire_segments(connections: Array[Dictionary], net_label: String = "") -> Array[Dictionary]:
+	var bus_connections: Array[Dictionary] = []
+	var pin_connections: Array[Dictionary] = []
 	for connection: Dictionary in connections:
-		if connection != driver:
-			loads.append(connection)
+		if connection.has("bus"):
+			bus_connections.append(connection)
+		else:
+			pin_connections.append(connection)
 
-	var bus_points := _breadboard_bus_points(net_label, loads.size())
-	if bus_points.is_empty():
-		return
+	bus_connections = _dedup_bus_connections(bus_connections)
+	if bus_connections.is_empty():
+		return _pin_fanout_segments(pin_connections)
 
-	_draw_bus_tie_strip(net_label, bus_points, color, highlighted)
-	_draw_wire(driver["position"], bus_points[0], color, line_width, net_label, 1, 1, highlighted)
+	var segments := _bus_tree_segments(bus_connections, pin_connections, net_label)
 
-	for index: int in range(loads.size()):
-		var bus_index: int = mini(index + 1, bus_points.size() - 1)
-		_draw_wire(bus_points[bus_index], loads[index]["position"], color, line_width, net_label, index + 1, loads.size(), highlighted)
+	for pin_connection: Dictionary in pin_connections:
+		if _pin_is_on_any_bus(pin_connection, bus_connections):
+			continue
 
+		var nearest_bus := _nearest_bus_connection(bus_connections, pin_connection["position"])
+		var bus_point := _connection_wire_point(nearest_bus, pin_connection["position"])
+		_add_wire_segment(segments, pin_connection["position"], bus_point)
 
-func _draw_bus_tie_strip(net_label: String, bus_points: Array[Vector2], color: Color, highlighted: bool) -> void:
-	if bus_points.is_empty():
-		return
-
-	var strip_rect := _bus_tie_rect(bus_points)
-	if highlighted:
-		_draw_rounded_rect(_expanded_rect(strip_rect, 4.0 * zoom), Color(color.r, color.g, color.b, 0.22), Color(color.r, color.g, color.b, 0.38), 1.0 * zoom, 6.0 * zoom)
-	_draw_rounded_rect(strip_rect, Color(color.r, color.g, color.b, 0.28 if highlighted else 0.18), Color(color.r, color.g, color.b, 0.85 if highlighted else 0.55), (2.0 if highlighted else 1.0) * zoom, 4.0 * zoom)
-
-	for point: Vector2 in bus_points:
-		draw_circle(point, (7.0 if highlighted else 5.2) * zoom, Color(color.r, color.g, color.b, 0.46 if highlighted else 0.36))
-		draw_circle(point, (3.3 if highlighted else 2.6) * zoom, color.lightened(0.28))
-
-	var font := get_theme_default_font()
-	var label := _short_bus_label(net_label)
-	var label_rect := Rect2(
-		Vector2(strip_rect.position.x - 22.0 * zoom, strip_rect.position.y - 13.0 * zoom),
-		Vector2(58.0, 11.0) * zoom
-	)
-	draw_string(font, label_rect.position + Vector2(0.0, label_rect.size.y), label, HORIZONTAL_ALIGNMENT_CENTER, label_rect.size.x, max(8, int(9 * zoom)), color.darkened(0.35))
+	return segments
 
 
-func _draw_power_net(net_label: String, connections: Array[Dictionary], color: Color, line_width: float, highlighted: bool) -> void:
+func _bus_tree_segments(bus_connections: Array[Dictionary], pin_connections: Array[Dictionary], net_label: String) -> Array[Dictionary]:
+	var segments: Array[Dictionary] = []
+	if bus_connections.size() < 2:
+		return segments
+
+	var route_y := _bus_route_y(net_label, bus_connections, pin_connections)
+	var root_bus := _root_bus_connection(bus_connections, pin_connections)
+	var target_buses: Array[Dictionary] = []
+	for bus_connection: Dictionary in bus_connections:
+		if bus_connection.get("bus", "") == root_bus.get("bus", ""):
+			continue
+		target_buses.append(bus_connection)
+
+	target_buses.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return Vector2(a.get("position", Vector2.ZERO)).x < Vector2(b.get("position", Vector2.ZERO)).x)
+
+	for target_bus: Dictionary in target_buses:
+		var target_point := _bus_landing_point(target_bus, route_y, root_bus.get("position", Vector2.ZERO))
+		var root_point := _bus_landing_point(root_bus, route_y, target_point)
+		_add_wire_segment(segments, root_point, target_point)
+
+	return segments
+
+
+func _pin_fanout_segments(pin_connections: Array[Dictionary]) -> Array[Dictionary]:
+	var segments: Array[Dictionary] = []
+	if pin_connections.size() < 2:
+		return segments
+
+	var anchor := _net_anchor_connection(pin_connections)
+	for connection: Dictionary in pin_connections:
+		if connection == anchor:
+			continue
+		_add_wire_segment(segments, anchor["position"], connection["position"])
+	return segments
+
+
+func _dedup_bus_connections(bus_connections: Array[Dictionary]) -> Array[Dictionary]:
+	var deduped: Array[Dictionary] = []
+	var seen := {}
+	for connection: Dictionary in bus_connections:
+		var bus_id: String = connection.get("bus", "")
+		if bus_id.is_empty() or seen.has(bus_id):
+			continue
+		seen[bus_id] = true
+		deduped.append(connection)
+	return deduped
+
+
+func _nearest_bus_connection(bus_connections: Array[Dictionary], target_position: Vector2) -> Dictionary:
+	var best_connection: Dictionary = bus_connections[0]
+	var best_distance := _connection_wire_point(best_connection, target_position).distance_squared_to(target_position)
+	for connection: Dictionary in bus_connections:
+		var point := _connection_wire_point(connection, target_position)
+		var distance := point.distance_squared_to(target_position)
+		if distance < best_distance:
+			best_distance = distance
+			best_connection = connection
+	return best_connection
+
+
+func _root_bus_connection(bus_connections: Array[Dictionary], pin_connections: Array[Dictionary]) -> Dictionary:
+	if not pin_connections.is_empty():
+		var driver := _net_anchor_connection(pin_connections)
+		return _nearest_bus_connection(bus_connections, driver["position"])
+
+	for connection: Dictionary in bus_connections:
+		if String(connection.get("bus", "")).begins_with("rail:"):
+			return connection
+	return bus_connections[0]
+
+
+func _bus_route_y(net_label: String, bus_connections: Array[Dictionary], pin_connections: Array[Dictionary]) -> float:
 	var board_rect := _grid_rect_to_screen(BOARD_GRID_RECT)
-	var rail_points: Array[Vector2] = []
+	var has_bottom_terminal := false
+	var has_top_terminal := false
+	var has_bottom_rail := false
+	var has_top_rail := false
 
-	for index: int in range(connections.size()):
-		var connection: Dictionary = connections[index]
-		var pin_position: Vector2 = connection["position"]
-		var rail_point := _power_rail_point(board_rect, net_label, pin_position, index)
-		rail_points.append(rail_point)
-		_draw_wire(rail_point, pin_position, color, line_width, net_label, 1, 1, highlighted)
-		_draw_power_landing(net_label, rail_point, color, highlighted)
+	for bus_connection: Dictionary in bus_connections:
+		var bus_id: String = bus_connection.get("bus", "")
+		if bus_id.begins_with("terminal:"):
+			has_bottom_terminal = has_bottom_terminal or bus_id.ends_with(":bottom")
+			has_top_terminal = has_top_terminal or bus_id.ends_with(":top")
+		elif bus_id.begins_with("rail:"):
+			has_bottom_rail = has_bottom_rail or bus_id.begins_with("rail:bottom:")
+			has_top_rail = has_top_rail or bus_id.begins_with("rail:top:")
 
-	_draw_power_rail_label(board_rect, net_label, color, highlighted)
+	if has_bottom_terminal:
+		return _best_visible_route_y(_lane_candidates_for_net(net_label, [
+			_bb830_row_y(board_rect, 6),
+			_bb830_row_y(board_rect, 7),
+			_bb830_row_y(board_rect, 8),
+			_bb830_row_y(board_rect, 9),
+		]), bus_connections, pin_connections)
+	if has_top_terminal:
+		return _best_visible_route_y(_lane_candidates_for_net(net_label, [
+			_bb830_row_y(board_rect, 3),
+			_bb830_row_y(board_rect, 2),
+			_bb830_row_y(board_rect, 1),
+			_bb830_row_y(board_rect, 0),
+		]), bus_connections, pin_connections)
+	if has_bottom_rail:
+		return _bb830_rail_y(board_rect, "bottom", "minus")
+	if has_top_rail:
+		return _bb830_rail_y(board_rect, "top", "plus")
+	return _average_points(_bus_average_positions(bus_connections)).y
 
 
-func _draw_power_landing(net_label: String, rail_point: Vector2, color: Color, highlighted: bool) -> void:
-	var radius := (7.0 if highlighted else 5.2) * zoom
-	draw_circle(rail_point, radius + 2.0 * zoom, Color(color.r, color.g, color.b, 0.18 if not highlighted else 0.32))
-	draw_circle(rail_point, radius, color)
-	draw_circle(rail_point, radius, Color(0.03, 0.03, 0.025), false, maxf(1.0, 1.2 * zoom))
-	if highlighted:
-		draw_circle(rail_point, radius + 5.0 * zoom, Color(color.r, color.g, color.b, 0.18), false, maxf(1.0, 2.0 * zoom))
+func _lane_candidates_for_net(net_label: String, candidates: Array) -> Array:
+	if candidates.is_empty():
+		return candidates
+
+	var lane_index := _wire_lane_for_net(net_label) % candidates.size()
+	var rotated: Array = []
+	for offset: int in range(candidates.size()):
+		rotated.append(candidates[(lane_index + offset) % candidates.size()])
+	return rotated
 
 
-func _draw_power_rail_label(board_rect: Rect2, net_label: String, color: Color, highlighted: bool) -> void:
-	var font := get_theme_default_font()
-	var y := board_rect.position.y + (34.0 if net_label == "VCC" else board_rect.size.y - 34.0) * zoom
-	var rect := Rect2(board_rect.position + Vector2(50.0, (34.0 if net_label == "VCC" else board_rect.size.y - 45.0)) * zoom, Vector2(52.0, 18.0) * zoom)
-	_draw_rounded_rect(rect, Color(color.r, color.g, color.b, 0.20 if not highlighted else 0.34), Color(color.r, color.g, color.b, 0.72), 1.0 * zoom, 4.0 * zoom)
-	draw_string(font, Vector2(rect.position.x, y + 5.0 * zoom), net_label, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, max(8, int(10 * zoom)), color.lightened(0.50 if net_label == "GND" else 0.25))
+func _wire_lane_for_net(net_label: String) -> int:
+	match net_label:
+		"A", "A xor B", "Y":
+			return 0
+		"B", "A and B", "SUM":
+			return 1
+		"Cin", "(A xor B) and Cin", "CARRY", "Cout":
+			return 2
+		"VCC", "GND":
+			return 3
+	return abs(hash(net_label)) % 4
+
+
+func _best_visible_route_y(candidates: Array, bus_connections: Array[Dictionary], pin_connections: Array[Dictionary]) -> float:
+	var spans := _route_spans_for_bus_connections(bus_connections, pin_connections)
+	var keepouts := _wire_keepout_rects()
+	var best_y: float = candidates[0]
+	var best_score := 1000000.0
+	for candidate in candidates:
+		var y := float(candidate)
+		var score := 0.0
+		for span: Vector2 in spans:
+			for keepout: Rect2 in keepouts:
+				if _horizontal_segment_intersects_rect(Vector2(span.x, y), Vector2(span.y, y), keepout):
+					score += 1.0
+		if score < best_score:
+			best_score = score
+			best_y = y
+	return best_y
+
+
+func _route_spans_for_bus_connections(bus_connections: Array[Dictionary], pin_connections: Array[Dictionary]) -> Array[Vector2]:
+	var xs: Array[float] = []
+	for bus_connection: Dictionary in bus_connections:
+		var position: Vector2 = bus_connection.get("position", Vector2.ZERO)
+		xs.append(position.x)
+	for pin_connection: Dictionary in pin_connections:
+		var position: Vector2 = pin_connection.get("position", Vector2.ZERO)
+		xs.append(position.x)
+	if xs.size() < 2:
+		return []
+
+	xs.sort()
+	return [Vector2(xs[0], xs[xs.size() - 1])]
+
+
+func _bus_average_positions(bus_connections: Array[Dictionary]) -> Array[Vector2]:
+	var positions: Array[Vector2] = []
+	for bus_connection: Dictionary in bus_connections:
+		positions.append(bus_connection.get("position", Vector2.ZERO))
+	return positions
+
+
+func _bus_landing_point(bus_connection: Dictionary, route_y: float, preferred_position = null) -> Vector2:
+	var points: Array[Vector2] = bus_connection.get("points", [])
+	if points.is_empty():
+		return bus_connection.get("position", Vector2.ZERO)
+
+	var best_point := points[0]
+	var best_score := 1000000.0
+	for point: Vector2 in points:
+		var score := absf(point.y - route_y)
+		if preferred_position != null:
+			var preferred: Vector2 = preferred_position
+			score += absf(point.x - preferred.x) * 0.18
+		if _point_is_in_wire_keepout(point):
+			score += 10000.0
+		if score < best_score:
+			best_score = score
+			best_point = point
+	return best_point
+
+
+func _pin_is_on_any_bus(pin_connection: Dictionary, bus_connections: Array[Dictionary]) -> bool:
+	for bus_connection: Dictionary in bus_connections:
+		if _pin_is_on_bus(pin_connection, bus_connection):
+			return true
+	return false
+
+
+func _pin_is_on_bus(pin_connection: Dictionary, bus_connection: Dictionary) -> bool:
+	var bus_point := _connection_wire_point(bus_connection, pin_connection["position"])
+	return bus_point.distance_to(pin_connection["position"]) <= maxf(2.0, 3.0 * zoom)
+
+
+func _add_wire_segment(segments: Array[Dictionary], start: Vector2, end: Vector2) -> void:
+	if start.distance_to(end) <= maxf(1.0, 1.4 * zoom):
+		return
+	segments.append({"start": start, "end": end})
+
+
+func _horizontal_segment_intersects_rect(start: Vector2, end: Vector2, rect: Rect2) -> bool:
+	if start.y < rect.position.y or start.y > rect.end.y:
+		return false
+	var min_x := minf(start.x, end.x)
+	var max_x := maxf(start.x, end.x)
+	return max_x >= rect.position.x and min_x <= rect.end.x
+
+
+func _point_is_in_wire_keepout(point: Vector2) -> bool:
+	for keepout: Rect2 in _wire_keepout_rects():
+		if keepout.has_point(point):
+			return true
+	return false
+
+
+func _wire_keepout_rects() -> Array[Rect2]:
+	var keepouts: Array[Rect2] = []
+	if not circuit:
+		return keepouts
+
+	for chip in circuit.chips:
+		keepouts.append(_expanded_rect(_chip_rect(chip), 7.0 * zoom))
+	return keepouts
+
+
+func _net_anchor_connection(connections: Array[Dictionary]) -> Dictionary:
+	for connection: Dictionary in connections:
+		if connection.has("bus"):
+			return connection
+	for connection: Dictionary in connections:
+		if connection["direction"] == &"out" or connection["direction"] == &"power":
+			return connection
+	return connections[0]
+
+
+func _connection_wire_point(connection: Dictionary, target_position: Vector2) -> Vector2:
+	if not connection.has("bus"):
+		return connection["position"]
+
+	var points: Array[Vector2] = connection.get("points", [])
+	if points.is_empty():
+		return connection["position"]
+
+	var best_point := points[0]
+	var best_distance := best_point.distance_squared_to(target_position)
+	for point: Vector2 in points:
+		var distance := point.distance_squared_to(target_position)
+		if distance < best_distance:
+			best_distance = distance
+			best_point = point
+	return best_point
+
+
+func _draw_bus_connection(connection: Dictionary, color: Color, highlighted: bool) -> void:
+	var points: Array[Vector2] = connection.get("points", [])
+	if points.is_empty():
+		return
+	if not highlighted:
+		return
+
+	var width := maxf(2.0, 2.6 * zoom) * (1.45 if highlighted else 1.0)
+	if points.size() > 1:
+		draw_polyline(PackedVector2Array(points), Color(color.r, color.g, color.b, 0.34 if highlighted else 0.22), width + 7.0 * zoom, true)
+		draw_polyline(PackedVector2Array(points), color, width, true)
+
+	for point: Vector2 in points:
+		draw_circle(point, (6.6 if highlighted else 5.0) * zoom, Color(color.r, color.g, color.b, 0.42 if highlighted else 0.28))
+		draw_circle(point, (2.8 if highlighted else 2.2) * zoom, color.lightened(0.25))
 
 
 func _net_connections(net) -> Array[Dictionary]:
 	var connections: Array[Dictionary] = []
 	for connection: Dictionary in net.connections:
+		if connection.has("bus"):
+			var bus_id: String = connection["bus"]
+			var bus_points := _bus_connection_points(bus_id)
+			if bus_points.is_empty():
+				continue
+			connections.append({
+				"bus": bus_id,
+				"position": _average_points(bus_points),
+				"points": bus_points,
+				"direction": &"passive",
+			})
+			continue
+
 		var chip = connection.get("chip")
 		var pin_name: StringName = connection.get("pin")
+		if chip == null:
+			continue
 		connections.append({
 			"chip": chip,
 			"pin": pin_name,
@@ -673,59 +1048,33 @@ func _hover_net_at(screen_position: Vector2) -> int:
 func _net_hit_distance(net, screen_position: Vector2) -> float:
 	var connections: Array[Dictionary] = _net_connections(net)
 	var best_distance := 1000000.0
-
-	if _is_power_net(net.label):
-		var board_rect := _grid_rect_to_screen(BOARD_GRID_RECT)
-		for index: int in range(connections.size()):
-			var pin_position: Vector2 = connections[index]["position"]
-			var rail_point := _power_rail_point(board_rect, net.label, pin_position, index)
-			best_distance = minf(best_distance, rail_point.distance_to(screen_position))
-			best_distance = minf(
-			best_distance,
-			_distance_to_polyline(screen_position, _wire_curve_points(rail_point, pin_position, net.label, 1, 1))
-		)
+	if connections.size() < 2:
 		return best_distance
 
-	if _uses_breadboard_bus(net.label, connections):
-		var driver := _first_driver_connection(connections)
-		var loads: Array[Dictionary] = []
-		for connection: Dictionary in connections:
-			if connection != driver:
-				loads.append(connection)
-
-		var bus_points := _breadboard_bus_points(net.label, loads.size())
-		if bus_points.is_empty():
-			return best_distance
-
-		best_distance = minf(best_distance, _distance_to_rect(screen_position, _expanded_rect(_bus_tie_rect(bus_points), 5.0 * zoom)))
-		best_distance = minf(
-			best_distance,
-			_distance_to_polyline(screen_position, _wire_curve_points(driver["position"], bus_points[0], net.label, 1, 1))
-		)
-
-		for index: int in range(loads.size()):
-			var bus_index: int = mini(index + 1, bus_points.size() - 1)
-			best_distance = minf(
-				best_distance,
-				_distance_to_polyline(
-					screen_position,
-					_wire_curve_points(bus_points[bus_index], loads[index]["position"], net.label, index + 1, loads.size())
-				)
-			)
-		return best_distance
-
-	var points: Array[Vector2] = []
 	for connection: Dictionary in connections:
-		points.append(connection["position"])
+		if connection.has("bus"):
+			best_distance = minf(best_distance, _distance_to_bus_connection(connection, screen_position))
 
-	var wire_count: int = points.size() - 1
-	for index: int in range(1, points.size()):
+	var segments := _net_wire_segments(connections, net.label)
+	for index: int in range(segments.size()):
+		var segment: Dictionary = segments[index]
+		var start: Vector2 = segment["start"]
+		var end: Vector2 = segment["end"]
 		best_distance = minf(
 			best_distance,
-			_distance_to_polyline(screen_position, _wire_curve_points(points[0], points[index], net.label, index, wire_count))
+			_distance_to_polyline(screen_position, _wire_curve_points(start, end, net.label, index + 1, segments.size()))
 		)
 
 	return best_distance
+
+
+func _distance_to_bus_connection(connection: Dictionary, screen_position: Vector2) -> float:
+	var points: Array[Vector2] = connection.get("points", [])
+	if points.is_empty():
+		return 1000000.0
+	if points.size() == 1:
+		return points[0].distance_to(screen_position)
+	return _distance_to_polyline(screen_position, PackedVector2Array(points))
 
 
 func _distance_to_polyline(point: Vector2, points: PackedVector2Array) -> float:
@@ -749,115 +1098,65 @@ func _distance_to_segment(point: Vector2, start: Vector2, end: Vector2) -> float
 	return point.distance_to(closest)
 
 
-func _distance_to_rect(point: Vector2, rect: Rect2) -> float:
-	if rect.has_point(point):
-		return 0.0
-
-	var dx := maxf(maxf(rect.position.x - point.x, 0.0), point.x - rect.end.x)
-	var dy := maxf(maxf(rect.position.y - point.y, 0.0), point.y - rect.end.y)
-	return Vector2(dx, dy).length()
-
-
-func _bus_tie_rect(bus_points: Array[Vector2]) -> Rect2:
-	var min_x := bus_points[0].x
-	var max_x := bus_points[0].x
-	var min_y := bus_points[0].y
-	var max_y := bus_points[0].y
-	for point: Vector2 in bus_points:
-		min_x = minf(min_x, point.x)
-		max_x = maxf(max_x, point.x)
-		min_y = minf(min_y, point.y)
-		max_y = maxf(max_y, point.y)
-
-	return Rect2(
-		Vector2(min_x - 7.0 * zoom, min_y - 7.0 * zoom),
-		Vector2(max_x - min_x + 14.0 * zoom, max_y - min_y + 14.0 * zoom)
-	)
-
-
 func _expanded_rect(rect: Rect2, amount: float) -> Rect2:
 	return Rect2(rect.position - Vector2(amount, amount), rect.size + Vector2(amount * 2.0, amount * 2.0))
 
 
-func _uses_breadboard_bus(net_label: String, connections: Array[Dictionary]) -> bool:
-	if not _has_bus_layout(net_label):
-		return false
-
-	var output_count := 0
-	var load_count := 0
-	for connection: Dictionary in connections:
-		if connection["direction"] == &"out":
-			output_count += 1
-		else:
-			load_count += 1
-
-	return output_count == 1 and load_count > 1
+func _bb830_hole_position(board_rect: Rect2, column: int, row_index: int) -> Vector2:
+	return Vector2(_bb830_column_x(board_rect, column), _bb830_row_y(board_rect, row_index))
 
 
-func _first_driver_connection(connections: Array[Dictionary]) -> Dictionary:
-	for connection: Dictionary in connections:
-		if connection["direction"] == &"out":
-			return connection
-	return connections[0]
-
-
-func _breadboard_bus_points(net_label: String, needed_slots: int) -> Array[Vector2]:
-	var layout := _bus_layout(net_label)
-	if layout.is_empty():
+func _bus_connection_points(bus_id: String) -> Array[Vector2]:
+	var parts := bus_id.split(":")
+	if parts.is_empty():
 		return []
 
 	var board_rect := _grid_rect_to_screen(BOARD_GRID_RECT)
+	match parts[0]:
+		"terminal":
+			if parts.size() < 3:
+				return []
+			var column := int(parts[1])
+			var half := parts[2]
+			return _terminal_bus_points(board_rect, column, half)
+		"rail":
+			if parts.size() < 3:
+				return []
+			return _rail_bus_points(board_rect, parts[1], parts[2])
+	return []
+
+
+func _terminal_bus_points(board_rect: Rect2, column: int, half: String) -> Array[Vector2]:
+	if column < 0 or column >= BREADBOARD_COLUMNS:
+		return []
+
 	var points: Array[Vector2] = []
-	var column: int = layout["column"]
-	var rows: Array = layout["rows"]
-	var slots: int = mini(needed_slots + 1, rows.size())
-
-	for index: int in range(slots):
-		points.append(_bb830_hole_position(board_rect, column, int(rows[index])))
-
+	var row_start := 5 if half == "bottom" else 0
+	for row_offset: int in range(5):
+		points.append(_bb830_hole_position(board_rect, column, row_start + row_offset))
 	return points
 
 
-func _bus_layout(net_label: String) -> Dictionary:
-	match net_label:
-		"A":
-			return {"column": 7, "rows": [0, 1, 2, 3, 4]}
-		"B":
-			return {"column": 11, "rows": [0, 1, 2, 3, 4]}
-		"Cin":
-			return {"column": 3, "rows": [0, 1, 2, 3, 4]}
-		"A xor B":
-			return {"column": 26, "rows": [0, 1, 2, 3, 4]}
-		"SUM":
-			return {"column": 45, "rows": [5, 6, 7, 8, 9]}
-		"Cout":
-			return {"column": 45, "rows": [0, 1, 2, 3, 4]}
-	return {}
+func _rail_bus_points(board_rect: Rect2, side: String, polarity: String) -> Array[Vector2]:
+	var rail_left := _bb830_column_x(board_rect, 0)
+	var rail_right := _bb830_column_x(board_rect, BREADBOARD_COLUMNS - 1)
+	var y := _bb830_rail_y(board_rect, side, polarity)
+
+	var points: Array[Vector2] = []
+	var gap := (rail_right - rail_left) / float(RAIL_HOLE_COUNT - 1)
+	for index: int in range(RAIL_HOLE_COUNT):
+		points.append(Vector2(rail_left + gap * index, y))
+	return points
 
 
-func _has_bus_layout(net_label: String) -> bool:
-	return not _bus_layout(net_label).is_empty()
+func _average_points(points: Array[Vector2]) -> Vector2:
+	if points.is_empty():
+		return Vector2.ZERO
 
-
-func _bb830_hole_position(board_rect: Rect2, column: int, row_index: int) -> Vector2:
-	var columns := 52
-	var hole_gap := (board_rect.size.x - 176.0 * zoom) / float(columns - 1)
-	var start_x := board_rect.position.x + 92.0 * zoom
-	return Vector2(start_x + hole_gap * column, _bb830_row_y(board_rect, row_index))
-
-
-func _power_rail_point(board_rect: Rect2, net_label: String, pin_position: Vector2, slot_index: int) -> Vector2:
-	var rail_left := board_rect.position.x + 68.0 * zoom
-	var rail_right := board_rect.end.x - 48.0 * zoom
-	var rail_y := board_rect.position.y + 34.0 * zoom
-
-	if net_label == "GND":
-		rail_y = board_rect.position.y + 80.0 * zoom if pin_position.y < board_rect.position.y + board_rect.size.y * 0.5 else board_rect.end.y - 34.0 * zoom
-	elif pin_position.y > board_rect.position.y + board_rect.size.y * 0.5:
-		rail_y = board_rect.end.y - 80.0 * zoom
-
-	var x := clampf(pin_position.x + float((slot_index % 3) - 1) * 8.0 * zoom, rail_left, rail_right)
-	return Vector2(x, rail_y)
+	var total := Vector2.ZERO
+	for point: Vector2 in points:
+		total += point
+	return total / float(points.size())
 
 
 func _pin_direction(chip, pin_name: StringName) -> StringName:
@@ -888,15 +1187,6 @@ func _net_value_label(net) -> String:
 		"GND":
 			return "0V"
 	return SignalValue.label(net.value)
-
-
-func _short_bus_label(net_label: String) -> String:
-	match net_label:
-		"A xor B":
-			return "A^B"
-		"(A xor B) and Cin":
-			return "(A^B)&Cin"
-	return net_label
 
 
 func _draw_wire(start: Vector2, end: Vector2, color: Color, width: float, net_label: String, connection_index: int, wire_count: int, highlighted: bool) -> void:
@@ -982,6 +1272,8 @@ func _wire_wobble(net_label: String, connection_index: int) -> float:
 func _draw_chip(chip) -> void:
 	var rect: Rect2 = _chip_rect(chip)
 	match chip.definition.id:
+		&"power_5v", &"ground":
+			_draw_supply_terminal(chip, rect)
 		&"toggle":
 			_draw_toggle(chip, rect)
 		&"led":
@@ -1115,6 +1407,28 @@ func _draw_resistor(chip, rect: Rect2) -> void:
 	draw_string(font, rect.position + Vector2(0.0, -3.0 * zoom), label, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, max(8, int(9 * zoom)), Color(0.18, 0.16, 0.11))
 
 
+func _draw_supply_terminal(chip, rect: Rect2) -> void:
+	var is_power: bool = chip.definition.id == &"power_5v"
+	var font := get_theme_default_font()
+	var title: String = chip.label if not chip.label.is_empty() else chip.definition.display_name
+	var accent := Color(0.86, 0.08, 0.06) if is_power else Color(0.02, 0.02, 0.018)
+	var fill := Color(0.91, 0.88, 0.76) if is_power else Color(0.72, 0.72, 0.66)
+	var symbol_center := rect.position + Vector2(rect.size.x * 0.42, rect.size.y * 0.48)
+
+	_draw_chip_shadow(rect)
+	_draw_rounded_rect(rect, fill, Color(0.45, 0.43, 0.36), 1.4 * zoom, 4.0 * zoom)
+	draw_circle(symbol_center, 13.0 * zoom, accent)
+	draw_circle(symbol_center, 13.0 * zoom, Color(0.02, 0.02, 0.018), false, maxf(1.0, 1.2 * zoom))
+	draw_line(symbol_center + Vector2(-6.0, 0.0) * zoom, symbol_center + Vector2(6.0, 0.0) * zoom, Color(0.98, 0.95, 0.82), maxf(1.2, 2.0 * zoom), true)
+	if is_power:
+		draw_line(symbol_center + Vector2(0.0, -6.0) * zoom, symbol_center + Vector2(0.0, 6.0) * zoom, Color(0.98, 0.95, 0.82), maxf(1.2, 2.0 * zoom), true)
+	else:
+		draw_line(symbol_center + Vector2(-7.0, 7.0) * zoom, symbol_center + Vector2(7.0, 7.0) * zoom, Color(0.98, 0.95, 0.82), maxf(1.2, 1.6 * zoom), true)
+		draw_line(symbol_center + Vector2(-4.0, 11.0) * zoom, symbol_center + Vector2(4.0, 11.0) * zoom, Color(0.98, 0.95, 0.82), maxf(1.0, 1.3 * zoom), true)
+
+	draw_string(font, rect.position + Vector2(0.0, rect.size.y + 12.0 * zoom), title, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, max(9, int(11 * zoom)), Color(0.15, 0.14, 0.11))
+
+
 func _draw_pin(chip, pin: Dictionary) -> void:
 	var pin_name: StringName = pin.get("name")
 	var position := _pin_position(chip, pin_name)
@@ -1166,17 +1480,28 @@ func _draw_placement_ghost() -> void:
 
 func _draw_wire_tool_overlay() -> void:
 	if not _wire_start.is_empty():
-		var start_position := _pin_ref_position(_wire_start)
+		var start_position := _wire_endpoint_position(_wire_start)
 		var end_position := _last_mouse_screen_position
 		if not _hovered_pin.is_empty():
 			end_position = _pin_ref_position(_hovered_pin)
+		elif not _hovered_bus.is_empty():
+			end_position = _wire_endpoint_position(_hovered_bus)
 
 		draw_line(start_position, end_position, Color(0.08, 0.07, 0.04, 0.36), maxf(4.0, 6.0 * zoom), true)
 		draw_line(start_position, end_position, Color(0.96, 0.72, 0.18, 0.92), maxf(2.0, 3.0 * zoom), true)
-		_draw_pin_tool_ring(_wire_start, Color(0.96, 0.72, 0.18))
+		_draw_endpoint_tool_ring(_wire_start, Color(0.96, 0.72, 0.18))
 
 	if not _hovered_pin.is_empty():
 		_draw_pin_tool_ring(_hovered_pin, Color(0.23, 0.52, 0.96))
+	elif not _hovered_bus.is_empty():
+		_draw_bus_tool_ring(_hovered_bus, Color(0.23, 0.52, 0.96))
+
+
+func _draw_endpoint_tool_ring(endpoint: Dictionary, color: Color) -> void:
+	if endpoint.get("type", &"") == &"pin":
+		_draw_pin_tool_ring(endpoint, color)
+	else:
+		_draw_bus_tool_ring(endpoint, color)
 
 
 func _draw_pin_tool_ring(pin_ref: Dictionary, color: Color) -> void:
@@ -1185,7 +1510,21 @@ func _draw_pin_tool_ring(pin_ref: Dictionary, color: Color) -> void:
 	draw_circle(position, maxf(6.0, 7.4 * zoom), color, false, maxf(1.4, 1.8 * zoom))
 
 
+func _draw_bus_tool_ring(bus_ref: Dictionary, color: Color) -> void:
+	var position := _wire_endpoint_position(bus_ref)
+	draw_circle(position, maxf(8.0, 10.0 * zoom), Color(color.r, color.g, color.b, 0.15))
+	draw_circle(position, maxf(5.8, 7.0 * zoom), color, false, maxf(1.3, 1.7 * zoom))
+	draw_circle(position, maxf(2.5, 3.3 * zoom), color.lightened(0.30))
+
+
 func _chip_rect(chip) -> Rect2:
+	if _is_breadboard_dip(chip):
+		return _breadboard_dip_rect(chip)
+	if _is_spanning_resistor(chip):
+		return _spanning_resistor_rect(chip)
+	if _has_any_pin_hole(chip):
+		return _anchored_chip_rect(chip)
+
 	var top_left := _world_to_screen(Vector2(chip.position) * GRID_SPACING)
 	return Rect2(top_left, _component_size(chip) * zoom)
 
@@ -1196,13 +1535,15 @@ func _component_size(chip) -> Vector2:
 
 func _component_size_for_definition(definition) -> Vector2:
 	match definition.id:
+		&"power_5v", &"ground":
+			return Vector2(60.0, 48.0)
 		&"toggle":
 			return Vector2(58.0, 48.0)
 		&"led":
 			return Vector2(68.0, 82.0)
 		&"resistor_2k2", &"resistor_220":
 			return Vector2(94.0, 30.0)
-		&"ic_7486", &"ic_7408", &"ic_7432":
+		&"ic_7400", &"ic_7404", &"ic_7486", &"ic_7408", &"ic_7432":
 			return Vector2(160.0, 88.0)
 		_:
 			return CHIP_SIZE
@@ -1215,6 +1556,10 @@ func _definition_rect(grid_position: Vector2i, definition) -> Rect2:
 
 func _definition_short_label(definition) -> String:
 	match definition.id:
+		&"ic_7400":
+			return "74LS00"
+		&"ic_7404":
+			return "74LS04"
 		&"ic_7486":
 			return "74LS86"
 		&"ic_7408":
@@ -1255,8 +1600,94 @@ func _pin_at(screen_position: Vector2) -> Dictionary:
 	return best_pin if best_distance <= threshold else {}
 
 
+func _breadboard_bus_at(screen_position: Vector2) -> Dictionary:
+	var best_bus: Dictionary = {}
+	var best_distance := 1000000.0
+	var threshold := maxf(9.0, 11.0 * zoom)
+
+	for column: int in range(BREADBOARD_COLUMNS):
+		for row_index: int in range(10):
+			var position := _breadboard_hole_screen_position(column, row_index)
+			var distance := position.distance_squared_to(screen_position)
+			if distance < best_distance:
+				best_distance = distance
+				best_bus = {
+					"type": &"bus",
+					"bus": _terminal_bus_id_for_hole(column, row_index),
+					"position": position,
+				}
+
+	var board_rect := _grid_rect_to_screen(BOARD_GRID_RECT)
+	var rail_specs := [
+		{"side": "top", "polarity": "plus"},
+		{"side": "top", "polarity": "minus"},
+		{"side": "bottom", "polarity": "plus"},
+		{"side": "bottom", "polarity": "minus"},
+	]
+	for rail: Dictionary in rail_specs:
+		var bus_id := "rail:%s:%s" % [rail["side"], rail["polarity"]]
+		for position: Vector2 in _rail_bus_points(board_rect, rail["side"], rail["polarity"]):
+			var distance := position.distance_squared_to(screen_position)
+			if distance < best_distance:
+				best_distance = distance
+				best_bus = {
+					"type": &"bus",
+					"bus": bus_id,
+					"position": position,
+				}
+
+	return best_bus if best_distance <= threshold * threshold else {}
+
+
+func _terminal_bus_id_for_hole(column: int, row_index: int) -> String:
+	return "terminal:%d:%s" % [column, "top" if row_index < 5 else "bottom"]
+
+
+func _pin_breadboard_bus_id(chip, pin_name: StringName) -> String:
+	var hole := _breadboard_hole_for_pin(chip, pin_name)
+	if hole.is_empty():
+		return ""
+	return _terminal_bus_id_for_hole(int(hole["column"]), int(hole["row"]))
+
+
+func _breadboard_hole_for_pin(chip, pin_name: StringName) -> Dictionary:
+	var pin_holes: Dictionary = chip.state.get("pin_holes", {})
+	if pin_holes.has(str(pin_name)):
+		var hole: Dictionary = pin_holes[str(pin_name)]
+		return {"column": int(hole.get("column", 0)), "row": int(hole.get("row", 0))}
+
+	if not _is_breadboard_dip(chip):
+		return {}
+
+	var pin_number := int(str(pin_name))
+	var origin_column: int = chip.state.get("dip_origin_column", 0)
+	if pin_number >= 1 and pin_number <= 7:
+		return {"column": origin_column + pin_number - 1, "row": 5}
+	if pin_number >= 8 and pin_number <= 14:
+		return {"column": origin_column + 14 - pin_number, "row": 4}
+	return {}
+
+
+func _same_wire_endpoint(endpoint_a: Dictionary, endpoint_b: Dictionary) -> bool:
+	var type_a: StringName = endpoint_a.get("type", &"")
+	var type_b: StringName = endpoint_b.get("type", &"")
+	if type_a != type_b:
+		return false
+	if type_a == &"pin":
+		return _same_pin_ref(endpoint_a, endpoint_b)
+	if type_a == &"bus":
+		return endpoint_a.get("bus", "") == endpoint_b.get("bus", "")
+	return false
+
+
 func _same_pin_ref(pin_a: Dictionary, pin_b: Dictionary) -> bool:
 	return pin_a.get("chip") == pin_b.get("chip") and pin_a.get("pin") == pin_b.get("pin")
+
+
+func _wire_endpoint_position(endpoint: Dictionary) -> Vector2:
+	if endpoint.get("type", &"") == &"pin":
+		return _pin_ref_position(endpoint)
+	return endpoint.get("position", Vector2.ZERO)
 
 
 func _pin_ref_position(pin_ref: Dictionary) -> Vector2:
@@ -1264,8 +1695,82 @@ func _pin_ref_position(pin_ref: Dictionary) -> Vector2:
 
 
 func _pin_position(chip, pin_name: StringName) -> Vector2:
+	var pin_holes: Dictionary = chip.state.get("pin_holes", {})
+	if pin_holes.has(str(pin_name)):
+		var hole: Dictionary = pin_holes[str(pin_name)]
+		return _breadboard_hole_screen_position(int(hole.get("column", 0)), int(hole.get("row", 0)))
+
+	if _is_breadboard_dip(chip):
+		return _breadboard_dip_pin_position(chip, pin_name)
+
 	var rect: Rect2 = _chip_rect(chip)
 	return _pin_position_for_definition(chip.definition, rect, pin_name)
+
+
+func _has_any_pin_hole(chip) -> bool:
+	var pin_holes: Dictionary = chip.state.get("pin_holes", {})
+	return not pin_holes.is_empty()
+
+
+func _is_breadboard_dip(chip) -> bool:
+	return chip.state.has("dip_origin_column")
+
+
+func _is_spanning_resistor(chip) -> bool:
+	if chip.definition.id not in [&"resistor_2k2", &"resistor_220"]:
+		return false
+
+	var pin_holes: Dictionary = chip.state.get("pin_holes", {})
+	return pin_holes.has("A") and pin_holes.has("B")
+
+
+func _spanning_resistor_rect(chip) -> Rect2:
+	var pin_a := _pin_position(chip, &"A")
+	var pin_b := _pin_position(chip, &"B")
+	var left := minf(pin_a.x, pin_b.x)
+	var right := maxf(pin_a.x, pin_b.x)
+	var center_y := (pin_a.y + pin_b.y) * 0.5
+	return Rect2(Vector2(left, center_y - 15.0 * zoom), Vector2(maxf(1.0, right - left), 30.0 * zoom))
+
+
+func _breadboard_hole_screen_position(column: int, row_index: int) -> Vector2:
+	return _bb830_hole_position(_grid_rect_to_screen(BOARD_GRID_RECT), column, row_index)
+
+
+func _breadboard_dip_pin_position(chip, pin_name: StringName) -> Vector2:
+	var pin_number := int(str(pin_name))
+	var origin_column: int = chip.state.get("dip_origin_column", 0)
+	var column := origin_column
+	var row_index := 5
+
+	if pin_number >= 1 and pin_number <= 7:
+		column = origin_column + pin_number - 1
+		row_index = 5
+	elif pin_number >= 8 and pin_number <= 14:
+		column = origin_column + 14 - pin_number
+		row_index = 4
+
+	return _breadboard_hole_screen_position(column, row_index)
+
+
+func _breadboard_dip_rect(chip) -> Rect2:
+	var pin_14 := _breadboard_dip_pin_position(chip, &"14")
+	var pin_7 := _breadboard_dip_pin_position(chip, &"7")
+	var center := (pin_14 + pin_7) * 0.5
+	var visual_size := DIP_VISUAL_SIZE * zoom
+	return Rect2(center - visual_size * 0.5, visual_size)
+
+
+func _anchored_chip_rect(chip) -> Rect2:
+	var first_pin_name: StringName = chip.definition.pins[0].get("name")
+	var pin_position := _pin_position(chip, first_pin_name)
+	var component_size := _component_size(chip) * zoom
+	match chip.definition.id:
+		&"power_5v", &"ground", &"toggle":
+			return Rect2(pin_position - Vector2(component_size.x - 3.0 * zoom, component_size.y * 0.5), component_size)
+		&"led":
+			return Rect2(pin_position - Vector2(8.0 * zoom, component_size.y * 0.34), component_size)
+	return Rect2(pin_position - component_size * 0.5, component_size)
 
 
 func _pin_position_for_definition(definition, rect: Rect2, pin_name: StringName) -> Vector2:
@@ -1308,17 +1813,17 @@ func _wire_color_for_net(net) -> Color:
 			return Color(0.88, 0.07, 0.05)
 		"Cout":
 			return Color(0.07, 0.58, 0.16)
+		"Y":
+			return Color(0.88, 0.07, 0.05)
+		"CARRY":
+			return Color(0.07, 0.58, 0.16)
 		"A xor B", "A and B", "(A xor B) and Cin":
 			return Color(0.95, 0.70, 0.08)
 	return WIRE_COLORS[net.id % WIRE_COLORS.size()]
 
 
 func _should_label_net(net_label: String) -> bool:
-	return net_label in ["VCC", "GND", "A", "B", "Cin", "SUM", "Cout"]
-
-
-func _is_power_net(net_label: String) -> bool:
-	return net_label in ["VCC", "GND"]
+	return net_label in ["VCC", "GND", "A", "B", "Cin", "Y", "SUM", "CARRY", "Cout"]
 
 
 func _grid_rect_to_screen(grid_rect: Rect2) -> Rect2:
