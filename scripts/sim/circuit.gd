@@ -9,14 +9,103 @@ signal changed
 
 var chips: Array = []
 var nets: Array = []
+# Physical jumper wires. Each entry is {"start": Hole, "end": Hole} where a Hole
+# is either {"column": int, "row": int} for a terminal hole or
+# {"rail": "side:polarity", "index": int} for a power-rail hole.
+var wires: Array = []
 
 var _next_chip_id := 1
+# Maps hole_key(hole) -> occupant descriptor so no two pins or wire ends can
+# ever share the same physical hole.
+var _hole_occupants: Dictionary = {}
 
 
 func add_net(net_label: String = "") -> int:
 	var net := NetScript.new(nets.size(), net_label)
 	nets.append(net)
 	return net.id
+
+
+# Returns the electrical bus a hole belongs to: a terminal column-half strip or
+# a power rail. Holes on the same bus are electrically common.
+func hole_bus_id(hole: Dictionary) -> String:
+	if hole.has("rail"):
+		return "rail:%s" % hole["rail"]
+	if hole.has("column") and hole.has("row"):
+		var half := "top" if int(hole["row"]) < 5 else "bottom"
+		return "terminal:%d:%s" % [int(hole["column"]), half]
+	return ""
+
+
+# Unique address for a single physical hole, used for occupancy bookkeeping.
+func hole_key(hole: Dictionary) -> String:
+	if hole.has("rail"):
+		return "rail:%s:%d" % [hole["rail"], int(hole.get("index", 0))]
+	if hole.has("column") and hole.has("row"):
+		return "%d:%d" % [int(hole["column"]), int(hole["row"])]
+	return ""
+
+
+func is_hole_free(hole: Dictionary) -> bool:
+	var key := hole_key(hole)
+	return not key.is_empty() and not _hole_occupants.has(key)
+
+
+# Claims a hole for the given occupant. Returns false (without changing state)
+# if the hole is already taken, which keeps wires and pins from overlapping.
+func occupy_hole(hole: Dictionary, occupant) -> bool:
+	var key := hole_key(hole)
+	if key.is_empty():
+		push_error("Cannot occupy an invalid hole.")
+		return false
+	if _hole_occupants.has(key):
+		return false
+	_hole_occupants[key] = occupant
+	return true
+
+
+# Returns the net wired to a bus, creating and labelling a fresh one if needed.
+func bus_net(bus_id: String, net_label: String = "") -> int:
+	if bus_id.is_empty():
+		push_error("Cannot resolve an empty breadboard bus.")
+		return -1
+
+	var net_id := _net_id_for_bus(bus_id)
+	if _is_valid_net_id(net_id):
+		if nets[net_id].label.is_empty() and not net_label.is_empty():
+			nets[net_id].label = net_label
+		return net_id
+
+	net_id = add_net(net_label)
+	connect_bus(bus_id, net_id)
+	return net_id
+
+
+# Places a physical jumper between two holes, merging their buses onto one net.
+# Both holes must be free; the endpoints are then marked occupied.
+func add_wire(start_hole: Dictionary, end_hole: Dictionary, net_label: String = "") -> int:
+	var start_bus := hole_bus_id(start_hole)
+	var end_bus := hole_bus_id(end_hole)
+	if start_bus.is_empty() or end_bus.is_empty():
+		push_error("Cannot place a wire on an invalid hole.")
+		return -1
+	if hole_key(start_hole) == hole_key(end_hole):
+		push_error("A wire cannot start and end in the same hole.")
+		return -1
+	if not is_hole_free(start_hole) or not is_hole_free(end_hole):
+		push_error("Wire endpoint hole is already occupied.")
+		return -1
+
+	var net_id := connect_buses(start_bus, end_bus, net_label)
+	if net_id < 0:
+		return -1
+
+	var wire := {"start": start_hole.duplicate(), "end": end_hole.duplicate()}
+	occupy_hole(start_hole, wire)
+	occupy_hole(end_hole, wire)
+	wires.append(wire)
+	changed.emit()
+	return net_id
 
 
 func add_chip(definition, position: Vector2i, label: String = ""):
@@ -160,14 +249,23 @@ func read_pin(chip, pin_name: StringName) -> int:
 	return nets[net_id].value
 
 
-func drive_pin(chip, pin_name: StringName, value: int) -> void:
+func drive_pin(chip, pin_name: StringName, value: int, weak: bool = false) -> void:
 	var net_id: int = chip.pin_nets.get(pin_name, -1)
 	if net_id < 0 or net_id >= nets.size():
 		return
-	nets[net_id].drivers.append(value)
+	if weak:
+		nets[net_id].weak_drivers.append(value)
+	else:
+		nets[net_id].drivers.append(value)
 
 
 func settle(max_iterations: int = 16) -> bool:
+	# Recompute steady state purely from the active drivers. Clearing stale net
+	# values first keeps bidirectional parts (like series resistors) from latching
+	# onto a previous level and fighting the gate that now drives them.
+	for net in nets:
+		net.value = SignalValue.State.Z
+
 	for _iteration in range(max_iterations):
 		var previous := _net_values()
 		_evaluate_once()
@@ -194,7 +292,9 @@ func _evaluate_once() -> void:
 		_evaluate_chip(chip)
 
 	for net in nets:
-		net.value = SignalValue.resolve(net.drivers)
+		# Strong drivers win; weak pull resistors only matter on an otherwise
+		# undriven net.
+		net.value = SignalValue.resolve(net.drivers if not net.drivers.is_empty() else net.weak_drivers)
 
 
 func _evaluate_chip(chip) -> void:
@@ -205,6 +305,8 @@ func _evaluate_chip(chip) -> void:
 			drive_pin(chip, &"OUT", SignalValue.State.LOW)
 		&"toggle":
 			drive_pin(chip, &"OUT", SignalValue.State.HIGH if chip.state.get("on", false) else SignalValue.State.LOW)
+		&"switch":
+			_evaluate_switch(chip)
 		&"led":
 			var value := read_pin(chip, &"IN")
 			var has_ground := read_pin(chip, &"GND") == SignalValue.State.LOW
@@ -229,11 +331,29 @@ func _is_valid_net_id(net_id: int) -> bool:
 
 
 func _evaluate_resistor(chip) -> void:
+	# A resistor passes a settled logic level between its legs, but only weakly:
+	# a strong source on either side overrides it (so a pull-down loses to VCC).
+	# Propagating only definite HIGH/LOW (never floating Z or unknown X) also stops
+	# the two legs from echoing transient states back and forth and oscillating.
 	var a_value := read_pin(chip, &"A")
 	var b_value := read_pin(chip, &"B")
-	if a_value != SignalValue.State.Z:
+	if a_value == SignalValue.State.LOW or a_value == SignalValue.State.HIGH:
+		drive_pin(chip, &"B", a_value, true)
+	if b_value == SignalValue.State.LOW or b_value == SignalValue.State.HIGH:
+		drive_pin(chip, &"A", b_value, true)
+
+
+# A pushbutton: while latched on it closes, conducting a definite level between
+# its two legs as a strong (ideal) contact; released, it is an open circuit.
+func _evaluate_switch(chip) -> void:
+	if not chip.state.get("on", false):
+		return
+
+	var a_value := read_pin(chip, &"A")
+	var b_value := read_pin(chip, &"B")
+	if a_value == SignalValue.State.LOW or a_value == SignalValue.State.HIGH:
 		drive_pin(chip, &"B", a_value)
-	if b_value != SignalValue.State.Z:
+	if b_value == SignalValue.State.LOW or b_value == SignalValue.State.HIGH:
 		drive_pin(chip, &"A", b_value)
 
 
@@ -275,6 +395,10 @@ func _bus_connection_exists(net_id: int, bus_id: String) -> bool:
 		if connection.get("bus", "") == bus_id:
 			return true
 	return false
+
+
+func net_id_for_bus(bus_id: String) -> int:
+	return _net_id_for_bus(bus_id)
 
 
 func _net_id_for_bus(bus_id: String) -> int:

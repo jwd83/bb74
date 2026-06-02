@@ -7,9 +7,18 @@ static func create_standard_library() -> Dictionary:
 	return {
 		&"toggle": ChipDefinitionScript.new(
 			&"toggle",
-			"Pushbutton",
+			"Logic Source",
 			[
 				{"name": &"OUT", "direction": &"out", "side": &"right"},
+			],
+			Color(0.18, 0.28, 0.38)
+		),
+		&"switch": ChipDefinitionScript.new(
+			&"switch",
+			"Pushbutton",
+			[
+				{"name": &"A", "direction": &"passive", "side": &"top"},
+				{"name": &"B", "direction": &"passive", "side": &"bottom"},
 			],
 			Color(0.18, 0.28, 0.38)
 		),

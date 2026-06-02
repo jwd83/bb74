@@ -26,7 +26,7 @@ const LEVEL_OPTIONS := [
 const PART_BUTTONS := [
 	{"id": &"power_5v", "label": "5V", "tooltip": "5V supply"},
 	{"id": &"ground", "label": "GND", "tooltip": "Ground"},
-	{"id": &"toggle", "label": "SW", "tooltip": "Pushbutton"},
+	{"id": &"switch", "label": "SW", "tooltip": "Pushbutton (pull-down input)"},
 	{"id": &"led", "label": "LED", "tooltip": "LED"},
 	{"id": &"ic_7400", "label": "00", "tooltip": "74LS00 NAND"},
 	{"id": &"ic_7404", "label": "04", "tooltip": "74LS04 NOT"},
@@ -424,71 +424,137 @@ func _create_level_circuit(level_id: StringName):
 			return _create_nand_starter_circuit()
 
 
+const RAIL_HOLE_COUNT := 52
+const RAIL_TOP_PLUS := "top:plus"
+const RAIL_BOTTOM_MINUS := "bottom:minus"
+
+
+func _active_library() -> Dictionary:
+	return _library if not _library.is_empty() else BuiltinChipsScript.create_standard_library()
+
+
+# Places the off-board 5V/GND supply terminals and binds them to the power rails.
 func _add_power_rails(circuit, power_position: Vector2i, ground_position: Vector2i) -> Dictionary:
 	var library: Dictionary = _active_library()
 	var power = circuit.add_chip(library[&"power_5v"], power_position, "5V")
 	var ground = circuit.add_chip(library[&"ground"], ground_position, "GND")
-	var net_vcc: int = circuit.add_net("VCC")
-	var net_gnd: int = circuit.add_net("GND")
+	var net_vcc: int = circuit.bus_net("rail:%s" % RAIL_TOP_PLUS, "VCC")
+	var net_gnd: int = circuit.bus_net("rail:%s" % RAIL_BOTTOM_MINUS, "GND")
 
 	circuit.connect_pin(power, &"OUT", net_vcc)
 	circuit.connect_pin(ground, &"OUT", net_gnd)
-	circuit.connect_bus(_rail_bus_id("top", "plus"), net_vcc)
-	circuit.connect_bus(_rail_bus_id("bottom", "minus"), net_gnd)
 
 	return {"VCC": net_vcc, "GND": net_gnd}
 
 
-func _rail_bus_id(side: String, polarity: String) -> String:
-	return "rail:%s:%s" % [side, polarity]
+# Maps a DIP pin number to the single breadboard hole it sits in. Pins 1-7 line
+# the bottom strip (row 5); pins 8-14 line the top strip (row 4), straddling the
+# centre groove exactly as a real DIP package does.
+func _dip_pin_hole(origin_column: int, pin_number: int) -> Dictionary:
+	if pin_number >= 1 and pin_number <= 7:
+		return {"column": origin_column + pin_number - 1, "row": 5}
+	if pin_number >= 8 and pin_number <= 14:
+		return {"column": origin_column + 14 - pin_number, "row": 4}
+	return {}
 
 
-func _terminal_bus_id(column: int, half: String) -> String:
-	return "terminal:%d:%s" % [column, half]
-
-
-func _place_dip(chip, origin_column: int) -> void:
+# Inserts a DIP package: every pin claims its own hole and joins that column's
+# strip net so neighbouring jumpers can pick it up.
+func _place_dip(circuit, chip, origin_column: int) -> void:
 	chip.state["dip_origin_column"] = origin_column
+	for pin: Dictionary in chip.definition.pins:
+		var pin_name: StringName = pin.get("name")
+		var hole := _dip_pin_hole(origin_column, int(str(pin_name)))
+		if hole.is_empty():
+			continue
+		circuit.occupy_hole(hole, {"chip": chip, "pin": pin_name})
+		circuit.connect_pin(chip, pin_name, circuit.bus_net(circuit.hole_bus_id(hole)))
 
 
-func _set_pin_hole(chip, pin_name: StringName, column: int, row_index: int) -> void:
+# Inserts a discrete component pin into one hole and joins its strip net.
+func _place_pin(circuit, chip, pin_name: StringName, hole: Dictionary, net_label: String = "") -> int:
 	if not chip.state.has("pin_holes"):
 		chip.state["pin_holes"] = {}
-	var pin_holes: Dictionary = chip.state["pin_holes"]
-	pin_holes[str(pin_name)] = {"column": column, "row": row_index}
-
-
-func _connect_terminal_pin(circuit, chip, pin_name: StringName, net_id: int, column: int, half: String, row_index: int) -> void:
-	_set_pin_hole(chip, pin_name, column, row_index)
+	chip.state["pin_holes"][str(pin_name)] = {"column": int(hole["column"]), "row": int(hole["row"])}
+	circuit.occupy_hole(hole, {"chip": chip, "pin": pin_name})
+	var net_id: int = circuit.bus_net(circuit.hole_bus_id(hole), net_label)
 	circuit.connect_pin(chip, pin_name, net_id)
-	circuit.connect_bus(_terminal_bus_id(column, half), net_id)
+	return net_id
 
 
-func _connect_led_with_resistor(circuit, led, output_net_id: int, resistor_label: String, resistor_a_column: int, resistor_b_column: int, led_column: int) -> void:
-	var library: Dictionary = _active_library()
-	var resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, resistor_label)
-	var led_net: int = circuit.add_net("%s LED" % led.label)
+# Returns the first unused hole in a terminal column-half, or {} if the strip is
+# full. Reserving the next free row is how a signal fans out across the strip.
+func _free_terminal_hole(circuit, column: int, half: String) -> Dictionary:
+	var rows := [0, 1, 2, 3, 4] if half == "top" else [5, 6, 7, 8, 9]
+	for row: int in rows:
+		var hole := {"column": column, "row": row}
+		if circuit.is_hole_free(hole):
+			return hole
+	push_error("No free hole in column %d %s strip." % [column, half])
+	return {}
 
-	_connect_terminal_pin(circuit, resistor, &"A", output_net_id, resistor_a_column, "bottom", 6)
-	_connect_terminal_pin(circuit, resistor, &"B", led_net, resistor_b_column, "bottom", 6)
-	_connect_terminal_pin(circuit, led, &"IN", led_net, led_column, "bottom", 7)
+
+# Returns a free rail hole, preferring one nearest preferred_index so a rail
+# jumper drops more or less straight down to the column it powers. Rail holes are
+# spaced one-per-column, so the target column makes a good preference.
+func _free_rail_hole(circuit, rail: String, preferred_index: int = 0) -> Dictionary:
+	for offset: int in range(RAIL_HOLE_COUNT):
+		for direction: int in ([0] if offset == 0 else [1, -1]):
+			var index := preferred_index + offset * direction
+			if index < 0 or index >= RAIL_HOLE_COUNT:
+				continue
+			var hole := {"rail": rail, "index": index}
+			if circuit.is_hole_free(hole):
+				return hole
+	push_error("No free hole in rail %s." % rail)
+	return {}
 
 
-func _connect_dip_pin(circuit, chip, pin_name: StringName, net_id: int) -> void:
-	var pin_number := int(str(pin_name))
-	var origin_column: int = chip.state.get("dip_origin_column", 0)
-	var column := origin_column
-	var half := "bottom"
+# Runs a jumper between two terminal strips, each end taking its own free hole.
+func _wire_columns(circuit, from_column: int, from_half: String, to_column: int, to_half: String, net_label: String = "") -> int:
+	var start_hole := _free_terminal_hole(circuit, from_column, from_half)
+	var end_hole := _free_terminal_hole(circuit, to_column, to_half)
+	if start_hole.is_empty() or end_hole.is_empty():
+		return -1
+	return circuit.add_wire(start_hole, end_hole, net_label)
 
-	if pin_number >= 1 and pin_number <= 7:
-		column = origin_column + pin_number - 1
-		half = "bottom"
-	elif pin_number >= 8 and pin_number <= 14:
-		column = origin_column + 14 - pin_number
-		half = "top"
 
-	circuit.connect_pin(chip, pin_name, net_id)
-	circuit.connect_bus(_terminal_bus_id(column, half), net_id)
+# Runs a jumper from a power rail to a terminal strip.
+func _wire_rail_to_column(circuit, rail: String, column: int, half: String, net_label: String = "") -> int:
+	var start_hole := _free_rail_hole(circuit, rail, column)
+	var end_hole := _free_terminal_hole(circuit, column, half)
+	if start_hole.is_empty() or end_hole.is_empty():
+		return -1
+	return circuit.add_wire(start_hole, end_hole, net_label)
+
+
+func _label_column_net(circuit, column: int, half: String, label: String) -> void:
+	circuit.bus_net("terminal:%d:%s" % [column, half], label)
+
+
+# Builds a resistor + LED indicator branch fed from a source column. The resistor
+# bridges res_a_col -> res_b_col; the LED shares res_b_col's strip and grounds out
+# through its own column to the negative rail.
+func _place_led_branch(circuit, led, resistor, source_column: int, source_half: String, res_a_col: int, res_b_col: int, led_gnd_col: int, label: String) -> void:
+	_place_pin(circuit, resistor, &"A", {"column": res_a_col, "row": 5})
+	_place_pin(circuit, resistor, &"B", {"column": res_b_col, "row": 5})
+	_place_pin(circuit, led, &"IN", _free_terminal_hole(circuit, res_b_col, "bottom"))
+	_place_pin(circuit, led, &"GND", {"column": led_gnd_col, "row": 5})
+	_wire_columns(circuit, source_column, source_half, res_a_col, "bottom", label)
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, led_gnd_col, "bottom", "GND")
+
+
+# Builds a real pushbutton input: the switch straddles the centre groove with its
+# top leg jumpered to the + rail and its bottom leg (the signal node) held LOW by a
+# pull-down resistor to the - rail. Pressing the switch ties the node to +5V.
+func _place_input_switch(circuit, switch, pulldown, sig_col: int, pd_col: int, label: String) -> void:
+	switch.state["on"] = false
+	_place_pin(circuit, switch, &"A", {"column": sig_col, "row": 4})         # top strip -> +rail
+	_place_pin(circuit, switch, &"B", {"column": sig_col, "row": 5}, label)  # bottom strip = signal
+	_place_pin(circuit, pulldown, &"A", {"column": sig_col, "row": 6})       # pull-down on the signal strip
+	_place_pin(circuit, pulldown, &"B", {"column": pd_col, "row": 5})
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, sig_col, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, pd_col, "bottom", "GND")
 
 
 func _create_sandbox_circuit():
@@ -499,30 +565,27 @@ func _create_sandbox_circuit():
 func _create_nand_starter_circuit():
 	var library: Dictionary = _active_library()
 	var circuit := CircuitScript.new()
-	var rails := _add_power_rails(circuit, Vector2i(-24, -8), Vector2i(-24, 5))
+	_add_power_rails(circuit, Vector2i(-24, -8), Vector2i(-24, 5))
 
-	var input_a = circuit.add_chip(library[&"toggle"], Vector2i(-22, -3), "A")
-	var input_b = circuit.add_chip(library[&"toggle"], Vector2i(-17, -3), "B")
+	var input_a = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "A")
+	var input_b = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "B")
+	var pulldown_a = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RA")
+	var pulldown_b = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RB")
 	var nand_chip = circuit.add_chip(library[&"ic_7400"], Vector2i(-4, -2), "7400")
 	var output_led = circuit.add_chip(library[&"led"], Vector2i(10, -1), "Y")
-	_place_dip(nand_chip, 24)
+	var output_resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, "R1")
 
-	input_a.state["on"] = false
-	input_b.state["on"] = false
+	# NAND gate A occupies pins 1 (col 10), 2 (col 11), 3 (col 12); power on 14/7.
+	_place_dip(circuit, nand_chip, 10)
+	_place_input_switch(circuit, input_a, pulldown_a, 2, 3, "A")
+	_place_input_switch(circuit, input_b, pulldown_b, 5, 6, "B")
+	_label_column_net(circuit, 12, "bottom", "Y")
 
-	var net_a: int = circuit.add_net("A")
-	var net_b: int = circuit.add_net("B")
-	var net_y: int = circuit.add_net("Y")
-
-	_connect_terminal_pin(circuit, input_a, &"OUT", net_a, 5, "bottom", 5)
-	_connect_terminal_pin(circuit, input_b, &"OUT", net_b, 10, "bottom", 5)
-	_connect_dip_pin(circuit, nand_chip, &"14", rails["VCC"])
-	_connect_dip_pin(circuit, nand_chip, &"7", rails["GND"])
-	_connect_dip_pin(circuit, nand_chip, &"1", net_a)
-	_connect_dip_pin(circuit, nand_chip, &"2", net_b)
-	_connect_dip_pin(circuit, nand_chip, &"3", net_y)
-	_connect_led_with_resistor(circuit, output_led, net_y, "R1", 33, 37, 37)
-	_connect_terminal_pin(circuit, output_led, &"GND", rails["GND"], 39, "bottom", 9)
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 10, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 16, "bottom", "GND")
+	_wire_columns(circuit, 2, "bottom", 10, "bottom", "A")
+	_wire_columns(circuit, 5, "bottom", 11, "bottom", "B")
+	_place_led_branch(circuit, output_led, output_resistor, 12, "bottom", 20, 23, 25, "Y")
 
 	return circuit
 
@@ -530,113 +593,101 @@ func _create_nand_starter_circuit():
 func _create_half_adder_circuit():
 	var library: Dictionary = _active_library()
 	var circuit := CircuitScript.new()
-	var rails := _add_power_rails(circuit, Vector2i(-26, -8), Vector2i(-26, 5))
+	_add_power_rails(circuit, Vector2i(-26, -8), Vector2i(-26, 5))
 
-	var input_a = circuit.add_chip(library[&"toggle"], Vector2i(-23, -3), "A")
-	var input_b = circuit.add_chip(library[&"toggle"], Vector2i(-18, -3), "B")
+	var input_a = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "A")
+	var input_b = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "B")
+	var pulldown_a = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RA")
+	var pulldown_b = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RB")
 	var xor_chip = circuit.add_chip(library[&"ic_7486"], Vector2i(-5, -5), "7486")
 	var and_chip = circuit.add_chip(library[&"ic_7408"], Vector2i(-5, 2), "7408")
 	var sum_led = circuit.add_chip(library[&"led"], Vector2i(1, 2), "SUM")
+	var sum_resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, "R1")
 	var carry_led = circuit.add_chip(library[&"led"], Vector2i(14, 2), "CARRY")
-	_place_dip(xor_chip, 18)
-	_place_dip(and_chip, 34)
+	var carry_resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, "R2")
 
-	input_a.state["on"] = false
-	input_b.state["on"] = false
+	_place_dip(circuit, xor_chip, 10)
+	_place_dip(circuit, and_chip, 20)
+	_place_input_switch(circuit, input_a, pulldown_a, 2, 3, "A")
+	_place_input_switch(circuit, input_b, pulldown_b, 5, 6, "B")
+	_label_column_net(circuit, 12, "bottom", "SUM")
+	_label_column_net(circuit, 22, "bottom", "CARRY")
 
-	var net_a: int = circuit.add_net("A")
-	var net_b: int = circuit.add_net("B")
-	var net_sum: int = circuit.add_net("SUM")
-	var net_carry: int = circuit.add_net("CARRY")
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 10, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 16, "bottom", "GND")
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 20, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 26, "bottom", "GND")
 
-	_connect_terminal_pin(circuit, input_a, &"OUT", net_a, 4, "bottom", 5)
-	_connect_terminal_pin(circuit, input_b, &"OUT", net_b, 9, "bottom", 5)
-	_connect_dip_pin(circuit, xor_chip, &"14", rails["VCC"])
-	_connect_dip_pin(circuit, xor_chip, &"7", rails["GND"])
-	_connect_dip_pin(circuit, xor_chip, &"1", net_a)
-	_connect_dip_pin(circuit, xor_chip, &"2", net_b)
-	_connect_dip_pin(circuit, xor_chip, &"3", net_sum)
-	_connect_dip_pin(circuit, and_chip, &"14", rails["VCC"])
-	_connect_dip_pin(circuit, and_chip, &"7", rails["GND"])
-	_connect_dip_pin(circuit, and_chip, &"1", net_a)
-	_connect_dip_pin(circuit, and_chip, &"2", net_b)
-	_connect_dip_pin(circuit, and_chip, &"3", net_carry)
-	_connect_led_with_resistor(circuit, sum_led, net_sum, "R1", 24, 28, 28)
-	_connect_terminal_pin(circuit, sum_led, &"GND", rails["GND"], 30, "bottom", 9)
-	_connect_led_with_resistor(circuit, carry_led, net_carry, "R2", 42, 46, 46)
-	_connect_terminal_pin(circuit, carry_led, &"GND", rails["GND"], 48, "bottom", 9)
+	# A and B each fan out to both gates from separate holes on their own strip.
+	_wire_columns(circuit, 2, "bottom", 10, "bottom", "A")
+	_wire_columns(circuit, 2, "bottom", 20, "bottom", "A")
+	_wire_columns(circuit, 5, "bottom", 11, "bottom", "B")
+	_wire_columns(circuit, 5, "bottom", 21, "bottom", "B")
+
+	_place_led_branch(circuit, sum_led, sum_resistor, 12, "bottom", 30, 33, 35, "SUM")
+	_place_led_branch(circuit, carry_led, carry_resistor, 22, "bottom", 40, 43, 45, "CARRY")
 
 	return circuit
-
-
-func _active_library() -> Dictionary:
-	return _library if not _library.is_empty() else BuiltinChipsScript.create_standard_library()
 
 
 func _create_full_adder_circuit():
 	var library: Dictionary = _active_library()
 	var circuit := CircuitScript.new()
-	var rails := _add_power_rails(circuit, Vector2i(-30, -8), Vector2i(-30, 5))
+	_add_power_rails(circuit, Vector2i(-30, -8), Vector2i(-30, 5))
 
-	var input_a = circuit.add_chip(library[&"toggle"], Vector2i(-25, -3), "A")
-	var input_b = circuit.add_chip(library[&"toggle"], Vector2i(-20, -3), "B")
-	var input_cin = circuit.add_chip(library[&"toggle"], Vector2i(-15, -3), "Cin")
+	var input_a = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "A")
+	var input_b = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "B")
+	var input_cin = circuit.add_chip(library[&"switch"], Vector2i.ZERO, "Cin")
+	var pulldown_a = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RA")
+	var pulldown_b = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RB")
+	var pulldown_cin = circuit.add_chip(library[&"resistor_2k2"], Vector2i.ZERO, "RC")
 	var xor_chip = circuit.add_chip(library[&"ic_7486"], Vector2i(-10, -2), "7486")
 	var and_chip = circuit.add_chip(library[&"ic_7408"], Vector2i(0, -2), "7408")
 	var or_chip = circuit.add_chip(library[&"ic_7432"], Vector2i(10, -2), "7432")
 	var sum_led = circuit.add_chip(library[&"led"], Vector2i(2, 2), "SUM")
+	var sum_resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, "R1")
 	var carry_led = circuit.add_chip(library[&"led"], Vector2i(20, 2), "Cout")
-	_place_dip(xor_chip, 16)
-	_place_dip(and_chip, 29)
-	_place_dip(or_chip, 40)
+	var carry_resistor = circuit.add_chip(library[&"resistor_220"], Vector2i.ZERO, "R2")
 
-	input_a.state["on"] = false
-	input_b.state["on"] = false
-	input_cin.state["on"] = false
+	# XOR pins 1-7 -> cols 11-17, AND -> cols 22-28, OR -> cols 33-39.
+	_place_dip(circuit, xor_chip, 11)
+	_place_dip(circuit, and_chip, 22)
+	_place_dip(circuit, or_chip, 33)
+	_place_input_switch(circuit, input_a, pulldown_a, 1, 2, "A")
+	_place_input_switch(circuit, input_b, pulldown_b, 4, 5, "B")
+	_place_input_switch(circuit, input_cin, pulldown_cin, 7, 8, "Cin")
+	_label_column_net(circuit, 13, "bottom", "A xor B")
+	_label_column_net(circuit, 16, "bottom", "SUM")
+	_label_column_net(circuit, 24, "bottom", "A and B")
+	_label_column_net(circuit, 27, "bottom", "(A xor B) and Cin")
+	_label_column_net(circuit, 35, "bottom", "Cout")
 
-	var net_vcc: int = rails["VCC"]
-	var net_gnd: int = rails["GND"]
-	var net_a = circuit.add_net("A")
-	var net_b = circuit.add_net("B")
-	var net_cin = circuit.add_net("Cin")
-	var net_a_xor_b = circuit.add_net("A xor B")
-	var net_sum = circuit.add_net("SUM")
-	var net_a_and_b = circuit.add_net("A and B")
-	var net_xor_and_cin = circuit.add_net("(A xor B) and Cin")
-	var net_cout = circuit.add_net("Cout")
+	# Power every chip from the rails.
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 11, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 17, "bottom", "GND")
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 22, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 28, "bottom", "GND")
+	_wire_rail_to_column(circuit, RAIL_TOP_PLUS, 33, "top", "VCC")
+	_wire_rail_to_column(circuit, RAIL_BOTTOM_MINUS, 39, "bottom", "GND")
 
-	_connect_terminal_pin(circuit, input_a, &"OUT", net_a, 3, "bottom", 5)
-	_connect_terminal_pin(circuit, input_b, &"OUT", net_b, 8, "bottom", 5)
-	_connect_terminal_pin(circuit, input_cin, &"OUT", net_cin, 13, "bottom", 5)
+	# Inputs fan out to the XOR and AND stages.
+	_wire_columns(circuit, 1, "bottom", 11, "bottom", "A")
+	_wire_columns(circuit, 1, "bottom", 22, "bottom", "A")
+	_wire_columns(circuit, 4, "bottom", 12, "bottom", "B")
+	_wire_columns(circuit, 4, "bottom", 23, "bottom", "B")
+	_wire_columns(circuit, 7, "bottom", 15, "bottom", "Cin")
+	_wire_columns(circuit, 7, "bottom", 26, "bottom", "Cin")
 
-	_connect_dip_pin(circuit, xor_chip, &"14", net_vcc)
-	_connect_dip_pin(circuit, xor_chip, &"7", net_gnd)
-	_connect_dip_pin(circuit, xor_chip, &"1", net_a)
-	_connect_dip_pin(circuit, xor_chip, &"2", net_b)
-	_connect_dip_pin(circuit, xor_chip, &"3", net_a_xor_b)
-	_connect_dip_pin(circuit, xor_chip, &"4", net_a_xor_b)
-	_connect_dip_pin(circuit, xor_chip, &"5", net_cin)
-	_connect_dip_pin(circuit, xor_chip, &"6", net_sum)
+	# A xor B feeds the second XOR input and the AND's second input.
+	_wire_columns(circuit, 13, "bottom", 14, "bottom", "A xor B")
+	_wire_columns(circuit, 13, "bottom", 25, "bottom", "A xor B")
 
-	_connect_dip_pin(circuit, and_chip, &"14", net_vcc)
-	_connect_dip_pin(circuit, and_chip, &"7", net_gnd)
-	_connect_dip_pin(circuit, and_chip, &"1", net_a)
-	_connect_dip_pin(circuit, and_chip, &"2", net_b)
-	_connect_dip_pin(circuit, and_chip, &"3", net_a_and_b)
-	_connect_dip_pin(circuit, and_chip, &"4", net_a_xor_b)
-	_connect_dip_pin(circuit, and_chip, &"5", net_cin)
-	_connect_dip_pin(circuit, and_chip, &"6", net_xor_and_cin)
+	# Carry path: (A and B) and ((A xor B) and Cin) into the OR gate.
+	_wire_columns(circuit, 24, "bottom", 33, "bottom", "A and B")
+	_wire_columns(circuit, 27, "bottom", 34, "bottom", "(A xor B) and Cin")
 
-	_connect_dip_pin(circuit, or_chip, &"14", net_vcc)
-	_connect_dip_pin(circuit, or_chip, &"7", net_gnd)
-	_connect_dip_pin(circuit, or_chip, &"1", net_a_and_b)
-	_connect_dip_pin(circuit, or_chip, &"2", net_xor_and_cin)
-	_connect_dip_pin(circuit, or_chip, &"3", net_cout)
-
-	_connect_led_with_resistor(circuit, sum_led, net_sum, "R1", 22, 26, 26)
-	_connect_terminal_pin(circuit, sum_led, &"GND", net_gnd, 28, "bottom", 9)
-	_connect_led_with_resistor(circuit, carry_led, net_cout, "R2", 45, 49, 49)
-	_connect_terminal_pin(circuit, carry_led, &"GND", net_gnd, 51, "bottom", 9)
+	_place_led_branch(circuit, sum_led, sum_resistor, 16, "bottom", 41, 44, 46, "SUM")
+	_place_led_branch(circuit, carry_led, carry_resistor, 35, "bottom", 47, 49, 51, "Cout")
 
 	return circuit
 
@@ -864,7 +915,7 @@ func _apply_truth_row(row_index: int) -> void:
 
 func _set_input(label: String, value: bool) -> void:
 	for chip in _circuit.chips:
-		if chip.definition.id == &"toggle" and chip.label == label:
+		if chip.definition.id in [&"switch", &"toggle"] and chip.label == label:
 			chip.state["on"] = value
 			return
 
